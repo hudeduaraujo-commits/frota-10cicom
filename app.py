@@ -4,11 +4,39 @@ import sqlite3
 import datetime
 import docx
 import os
+import io
 
+# Configuração da Página
 st.set_page_config(page_title="Gestão de Frota - 10ª CICOM", layout="wide", page_icon="🚔")
 
 DB_FILE = "frota_10cicom.db"
 
+# --- CONTROLE DE ACESSO (LOGIN) ---
+SENHA_PADRAO = "10cicom"  # Altere aqui se desejar outra senha
+
+def check_login():
+    if "autenticado" not in st.session_state:
+        st.session_state.autenticado = False
+
+    if not st.session_state.autenticado:
+        st.markdown("<h2 style='text-align: center;'>🚔 Gestão de Frota - 10ª CICOM</h2>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center;'>Acesso restrito ao efetivo autorizado</p>", unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns([1, 1.2, 1])
+        with col2:
+            with st.form("form_login"):
+                senha = st.text_input("Digite a Senha de Acesso", type="password")
+                entrar = st.form_submit_button("Entrar no Sistema", use_container_width=True)
+                if entrar:
+                    if senha == SENHA_PADRAO:
+                        st.session_state.autenticado = True
+                        st.rerun()
+                    else:
+                        st.error("Senha incorreta. Tente novamente.")
+        return False
+    return True
+
+# --- BANCO DE DADOS ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -46,17 +74,17 @@ def init_db():
     )
     """)
     
-    c.execute("SELECT COUNT(*) FROM viaturas")
-    if c.fetchone()[0] == 0:
-        frota = [
-            ("25-1001", "S10", "Diesel", "TRX-6I85", "Ativa", 30000, 40000),
-            ("25-1111", "S10", "Diesel", "TRX-4B85", "Ativa", 50000, 60000),
-            ("25-1329", "Spin", "Gasolina", "TRZ-7E17", "Ativa", 0, 10000),
-            ("25-1353", "Spin", "Gasolina", "TSC-2D46", "Emprestada", 0, 10000),
-            ("25-1394", "Spin", "Gasolina", "UTS-3J57", "Ativa", 0, 10000)
-        ]
-        c.executemany("INSERT OR REPLACE INTO viaturas VALUES (?, ?, ?, ?, ?, ?, ?)", frota)
+    # Frota padrão
+    frota = [
+        ("25-1001", "S10", "Diesel", "TRX-6I85", "Ativa", 30000, 40000),
+        ("25-1111", "S10", "Diesel", "TRX-4B85", "Ativa", 50000, 60000),
+        ("25-1329", "Spin", "Gasolina", "TRZ-7E17", "Ativa", 0, 10000),
+        ("25-1353", "Spin", "Gasolina", "TSC-2D46", "Emprestada", 0, 10000),
+        ("25-1394", "Spin", "Gasolina", "UTS-3J57", "Ativa", 0, 10000)
+    ]
+    c.executemany("INSERT OR IGNORE INTO viaturas VALUES (?, ?, ?, ?, ?, ?, ?)", frota)
     
+    # Remove duplicidades se houver
     c.execute("""
         DELETE FROM abastecimentos 
         WHERE id NOT IN (
@@ -103,23 +131,77 @@ def extrair_texto_word(uploaded_file):
     texto_completo = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     return "\n".join(texto_completo)
 
+def converter_df_para_excel(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Relatorio')
+    return output.getvalue()
+
 init_db()
 
-st.title("🚔 Sistema de Gestão de Frota - 10ª CICOM")
+# Verifica se o usuário está autenticado
+if not check_login():
+    st.stop()
 
-menu = st.sidebar.radio("Navegação", [
-    "Controle de Abastecimento", 
-    "Status da Frota & Revisões", 
-    "Livro de Ocorrências / Avarias", 
-    "Histórico Geral", 
-    "📥 Importar Planilha Excel"
-])
+# --- BARRA LATERAL ---
+with st.sidebar:
+    st.title("🚔 10ª CICOM")
+    st.write("Sistema Integrado de Frota")
+    menu = st.radio("Navegação", [
+        "📊 Painel de Controle (Dashboard)",
+        "⛽ Controle de Abastecimento", 
+        "🛠️ Status da Frota & Revisões", 
+        "📋 Livro de Ocorrências / Avarias", 
+        "🔎 Consulta & Exportação Excel", 
+        "📥 Importar Planilha Excel"
+    ])
+    st.write("---")
+    if st.button("🚪 Sair do Sistema"):
+        st.session_state.autenticado = False
+        st.rerun()
 
 conn = sqlite3.connect(DB_FILE)
 
-# 1. ABASTECIMENTO
-if menu == "Controle de Abastecimento":
+# 1. PAINEL DE CONTROLE (DASHBOARD)
+if menu == "📊 Painel de Controle (Dashboard)":
+    st.subheader("📊 Indicadores Gerais de Consumo e Frota")
+    
+    df_abast = pd.read_sql_query("SELECT * FROM abastecimentos", conn)
+    df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
+    
+    if not df_abast.empty:
+        # Extrai os litros como número
+        df_abast['litros_num'] = df_abast['litros_liberados'].str.replace('L', '').str.replace('l', '').astype(float, errors='ignore')
+        df_abast['litros_num'] = pd.to_numeric(df_abast['litros_num'], errors='coerce').fillna(0)
+        
+        total_litros = df_abast['litros_num'].sum()
+        total_abast = len(df_abast)
+        vtrs_ativas = len(df_vtr[df_vtr['status'] == 'Ativa'])
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total de Abastecimentos", f"{total_abast} registros")
+        col2.metric("Total de Combustível Liberado", f"{total_litros:.0f} Litros")
+        col3.metric("Viaturas Ativas", f"{vtrs_ativas} viaturas")
+        
+        st.write("---")
+        
+        c_graf1, c_graf2 = st.columns(2)
+        with c_graf1:
+            st.write("##### ⛽ Consumo Total de Litros por Viatura")
+            consumo_vtr = df_abast.groupby('prefixo')['litros_num'].sum()
+            st.bar_chart(consumo_vtr)
+            
+        with c_graf2:
+            st.write("##### 📈 Quantidade de Abastecimentos por Viatura")
+            qtd_vtr = df_abast['prefixo'].value_counts()
+            st.bar_chart(qtd_vtr)
+    else:
+        st.info("Nenhum dado de abastecimento cadastrado para gerar o painel.")
+
+# 2. ABASTECIMENTO
+elif menu == "⛽ Controle de Abastecimento":
     st.subheader("⛽ Lançamento e Liberação Diária de Combustível")
+    
     col1, col2 = st.columns(2)
     with col1:
         prefixo = st.selectbox("Selecione a Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"])
@@ -169,7 +251,7 @@ if menu == "Controle de Abastecimento":
         else:
             st.error(msg)
 
-    if st.button("Confirmar Lançamento"):
+    if st.button("Confirmar Lançamento", use_container_width=True):
         if not motorista:
             st.warning("Informe o nome do motorista.")
         elif not liberado:
@@ -181,8 +263,8 @@ if menu == "Controle de Abastecimento":
             conn.commit()
             st.success("Abastecimento registrado com sucesso!")
 
-# 2. STATUS & REVISÕES
-elif menu == "Status da Frota & Revisões":
+# 3. STATUS & REVISÕES
+elif menu == "🛠️ Status da Frota & Revisões":
     st.subheader("🛠️ Monitoramento de Manutenção Preventiva")
     df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
     
@@ -214,8 +296,8 @@ elif menu == "Status da Frota & Revisões":
     
     st.dataframe(df_vtr[['prefixo', 'modelo', 'placa', 'status', 'KM Atual', 'km_proxima_revisao', 'KM Restante p/ Revisão', 'Status Revisão']], use_container_width=True)
 
-# 3. OCORRÊNCIAS / AVARIAS
-elif menu == "Livro de Ocorrências / Avarias":
+# 4. OCORRÊNCIAS / AVARIAS
+elif menu == "📋 Livro de Ocorrências / Avarias":
     st.subheader("📋 Registro de Alterações, Arranhões e Sinistros")
     tab1, tab2 = st.tabs(["✍️ Digitação Manual", "📄 Importar do Word (.docx)"])
     
@@ -268,13 +350,44 @@ elif menu == "Livro de Ocorrências / Avarias":
     df_oc = pd.read_sql_query("SELECT data_hora as Data, prefixo as Viatura, tipo as Tipo, motorista as Envolvido, descricao as Detalhes FROM ocorrencias ORDER BY id DESC", conn)
     st.dataframe(df_oc, use_container_width=True)
 
-# 4. HISTÓRICO GERAL
-elif menu == "Histórico Geral":
-    st.subheader("📊 Histórico Geral de Abastecimentos")
+# 5. CONSULTA & EXPORTAÇÃO EXCEL
+elif menu == "🔎 Consulta & Exportação Excel":
+    st.subheader("🔎 Busca Avançada e Exportação de Relatórios")
+    
     df_abast = pd.read_sql_query("SELECT data as Data, prefixo as Viatura, motorista as Motorista, km_atual as [KM Odômetro], litros_liberados as [Qtd Liberada], horario as Horário FROM abastecimentos ORDER BY data DESC, id DESC", conn)
-    st.dataframe(df_abast, use_container_width=True)
+    
+    if not df_abast.empty:
+        col_f1, col_f2, col_f3 = st.columns(3)
+        with col_f1:
+            filtro_vtr = st.selectbox("Filtrar por Viatura", ["Todas"] + list(df_abast['Viatura'].unique()))
+        with col_f2:
+            filtro_motorista = st.text_input("Buscar por Motorista")
+        with col_f3:
+            filtro_data = st.date_input("Filtrar por Data Específica", value=None)
+            
+        df_filtrado = df_abast.copy()
+        if filtro_vtr != "Todas":
+            df_filtrado = df_filtrado[df_filtrado['Viatura'] == filtro_vtr]
+        if filtro_motorista:
+            df_filtrado = df_filtrado[df_filtrado['Motorista'].str.contains(filtro_motorista, case=False, na=False)]
+        if filtro_data is not None:
+            df_filtrado = df_filtrado[df_filtrado['Data'] == filtro_data.strftime("%Y-%m-%d")]
+            
+        st.write(f"**Registros encontrados:** {len(df_filtrado)}")
+        st.dataframe(df_filtrado, use_container_width=True)
+        
+        # Botão para baixar planilha Excel
+        excel_bytes = converter_df_para_excel(df_filtrado)
+        st.download_button(
+            label="📥 Baixar estes dados em Planilha Excel (.xlsx)",
+            data=excel_bytes,
+            file_name="Relatorio_Abastecimento_10CICOM.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("Nenhum dado encontrado para consulta.")
 
-# 5. IMPORTAR PLANILHA EXCEL
+# 6. IMPORTAR PLANILHA EXCEL
 elif menu == "📥 Importar Planilha Excel":
     st.subheader("📥 Importar Dados de Planilha de Abastecimento (.xlsx)")
     st.write("Faça o envio de uma planilha no modelo da 10ª CICOM para carregar os registros no sistema:")
