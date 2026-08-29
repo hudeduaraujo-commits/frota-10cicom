@@ -106,7 +106,6 @@ def interpretar_dados_mensagem(texto):
         except ValueError:
             pass
     else:
-        # Tenta pegar qualquer número de 4 a 6 dígitos
         match_numeros = re.findall(r'\b[0-9]{4,6}\b', texto_clean)
         if match_numeros:
             for num in match_numeros:
@@ -127,7 +126,7 @@ def interpretar_dados_mensagem(texto):
         except ValueError:
             pass
             
-    # 5. Verifica se é Assunção ou Não Abasteceu
+    # 5. Classifica o Tipo de Operação
     if "ASSUNÇÃO" in texto_clean or "ENTRADA" in texto_clean or "INÍCIO" in texto_clean:
         dados["tipo_operacao"] = "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)"
         dados["status_registro"] = "Assunção de Serviço"
@@ -285,10 +284,11 @@ def salvar_foto(foto_file, prefixo, tipo_evento):
         return caminho
     return None
 
-def converter_df_para_excel(df):
+def converter_dfs_para_excel_multiplas_abas(df_abast, df_assuncao):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Relatorio')
+        df_abast.to_excel(writer, index=False, sheet_name='Abastecimentos')
+        df_assuncao.to_excel(writer, index=False, sheet_name='Assuncao_Servico')
     return output.getvalue()
 
 init_db()
@@ -336,28 +336,30 @@ if menu == "📊 Painel de Controle (Dashboard)":
     df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
     
     if not df_abast.empty:
-        df_abast['litros_num'] = df_abast['litros_liberados'].str.replace('L', '', case=False).astype(float, errors='ignore')
-        df_abast['litros_num'] = pd.to_numeric(df_abast['litros_num'], errors='coerce').fillna(0)
+        df_so_abast = df_abast[df_abast['status_registro'] == 'Abastecido'].copy()
+        df_so_abast['litros_num'] = df_so_abast['litros_liberados'].str.replace('L', '', case=False).astype(float, errors='ignore')
+        df_so_abast['litros_num'] = pd.to_numeric(df_so_abast['litros_num'], errors='coerce').fillna(0)
         
-        total_litros = df_abast['litros_num'].sum()
-        total_abast = len(df_abast[df_abast['litros_num'] > 0])
-        total_nao_abast = len(df_abast[df_abast['status_registro'].isin(['Não Abasteceu (N/A)', 'Assunção de Serviço'])])
+        total_litros = df_so_abast['litros_num'].sum()
+        total_abast = len(df_so_abast[df_so_abast['litros_num'] > 0])
+        total_assuncoes = len(df_abast[df_abast['status_registro'] == 'Assunção de Serviço'])
+        total_nao_abast = len(df_abast[df_abast['status_registro'] == 'Não Abasteceu (N/A)'])
         vtrs_ativas = len(df_vtr[df_vtr['status'] == 'Ativa'])
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Abastecimentos Realizados", f"{total_abast}")
-        c2.metric("Registros Sem Abastecer (N/A)", f"{total_nao_abast}")
+        c2.metric("Assunções de Serviço (KM Inicial)", f"{total_assuncoes}")
         c3.metric("Total Combustível", f"{total_litros:.0f} Litros")
         c4.metric("Viaturas Ativas", f"{vtrs_ativas}")
         
         st.write("---")
         cg1, cg2 = st.columns(2)
         with cg1:
-            st.write("##### ⛽ Consumo Total de Litros por Viatura")
-            consumo_vtr = df_abast.groupby('prefixo')['litros_num'].sum()
+            st.write("##### ⛽ Consumo Real de Combustível por Viatura (Exclui KM Inicial)")
+            consumo_vtr = df_so_abast.groupby('prefixo')['litros_num'].sum()
             st.bar_chart(consumo_vtr)
         with cg2:
-            st.write("##### 📈 Status dos Registros da Frota")
+            st.write("##### 📈 Distribuição dos Registros da Unidade")
             status_cont = df_abast['status_registro'].value_counts()
             st.bar_chart(status_cont)
     else:
@@ -366,13 +368,13 @@ if menu == "📊 Painel de Controle (Dashboard)":
 # 2. LEITURA AUTOMÁTICA DE PRINT / WHATSAPP (OCR)
 elif menu == "🤖 Leitura Automática de Print (OCR)":
     st.subheader("🤖 Leitura Automática de Print do WhatsApp ou Foto do Painel")
-    st.write("Envie o **print da conversa do WhatsApp** (com a foto e o texto) ou cole a mensagem. O sistema lerá tudo e preencherá os campos automaticamente.")
+    st.write("Envie o **print da conversa do WhatsApp** (com a foto e o texto) ou cole a mensagem. O sistema separará automaticamente se é Abastecimento ou KM Inicial.")
     
     col_up1, col_up2 = st.columns(2)
     with col_up1:
         print_upload = st.file_uploader("Selecione o Print / Foto do WhatsApp", type=["jpg", "jpeg", "png"])
     with col_up2:
-        texto_colado = st.text_area("Ou Cole o Texto do WhatsApp aqui (Opcional):", placeholder="Ex: VTR 25-1001, Cb Silva, KM: 45200, Autonomia 65km")
+        texto_colado = st.text_area("Ou Cole o Texto do WhatsApp aqui (Opcional):", placeholder="Ex: VTR 25-1001, Cb Silva, KM Inicial: 45200")
         
     dados_extraidos = {
         "prefixo": "25-1001",
@@ -417,11 +419,13 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
             ], index=["⛽ Realizar Abastecimento", "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)", "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"].index(dados_extraidos["tipo_operacao"]))
             autonomia_conf = st.number_input("Autonomia informada (km)", value=dados_extraidos["autonomia"], step=1.0)
 
-        # Regra de cálculo de cota
         liberado = True
         litros = "0L"
+        status_reg_salvar = "Abastecido"
         obs = "Lançamento via Leitura Automática (OCR)"
+        
         if tipo_conf == "⛽ Realizar Abastecimento":
+            status_reg_salvar = "Abastecido"
             if prefixo_conf in ["25-1001", "25-1111"]:
                 if 0 < autonomia_conf <= 70:
                     litros = "60L"
@@ -438,7 +442,12 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
                     litros = "35L"
                 else:
                     litros = "0L"
+        elif tipo_conf == "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)":
+            status_reg_salvar = "Assunção de Serviço"
+            litros = "0L"
+            obs = "KM Inicial de Entrada de Turno"
         elif tipo_conf == "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)":
+            status_reg_salvar = "Não Abasteceu (N/A)"
             litros = "N/A"
             obs = "Não Abasteceu (N/A)"
 
@@ -447,20 +456,20 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
             if not motorista_conf:
                 st.warning("Preencha o nome do motorista.")
             else:
-                caminho_foto = salvar_foto(print_upload, prefixo_conf, "OCR")
+                caminho_foto = salvar_foto(print_upload, prefixo_conf, status_reg_salvar[:5])
                 c = conn.cursor()
                 c.execute("""
                     INSERT OR IGNORE INTO abastecimentos 
                     (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, foto_painel, observacao) 
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (data_conf.strftime("%Y-%m-%d"), prefixo_conf, motorista_conf, km_conf, litros, hora_conf.strftime("%H:%M"), tipo_conf.split()[1], caminho_foto, obs))
+                """, (data_conf.strftime("%Y-%m-%d"), prefixo_conf, motorista_conf, km_conf, litros, hora_conf.strftime("%H:%M"), status_reg_salvar, caminho_foto, obs))
                 conn.commit()
-                st.success("✅ Registro gravado com sucesso no banco de dados!")
+                st.success(f"✅ Registro de **{status_reg_salvar}** gravado separadamente com sucesso!")
                 st.rerun()
 
 # 3. CHECK-IN & ABASTECIMENTO MANUAL
 elif menu == "📸 Check-in & Abastecimento":
-    st.subheader("📸 Registro Diário do Motorista: Assunção ou Abastecimento")
+    st.subheader("📸 Registro Diário do Motorista")
     
     tipo_operacao = st.radio("Selecione o Tipo de Registro:", [
         "⛽ Realizar Abastecimento", 
@@ -568,12 +577,12 @@ elif menu == "📸 Check-in & Abastecimento":
 # 4. CORRIGIR / EDITAR LANÇAMENTO
 elif menu == "✏️ Corrigir / Editar Lançamento":
     st.subheader("✏️ Correção e Edição de Lançamentos Anteriores")
-    st.info("Caso o motorista tenha digitado o KM ou o prefixo errado, selecione o registro abaixo para corrigir:")
+    st.info("Selecione o registro para ajustar o KM, prefixo ou o tipo de evento (Abastecimento vs. Assunção):")
     
     df_todos = pd.read_sql_query("SELECT id, data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao FROM abastecimentos ORDER BY id DESC", conn)
     
     if not df_todos.empty:
-        opcoes_regs = [f"ID {r['id']} | Data: {r['data']} | VTR: {r['prefixo']} | KM: {r['km_atual']} | Mot: {r['motorista']}" for _, r in df_todos.iterrows()]
+        opcoes_regs = [f"ID {r['id']} | [{r['status_registro']}] {r['data']} | VTR: {r['prefixo']} | KM: {r['km_atual']} | Mot: {r['motorista']}" for _, r in df_todos.iterrows()]
         escolha = st.selectbox("Selecione o registro para editar:", opcoes_regs)
         
         reg_id = int(escolha.split(" | ")[0].replace("ID ", ""))
@@ -586,6 +595,7 @@ elif menu == "✏️ Corrigir / Editar Lançamento":
                 vtr_edit = st.selectbox("Prefixo da Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"], index=["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"].index(item['prefixo']) if item['prefixo'] in ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"] else 0)
                 mot_edit = st.text_input("Motorista", value=str(item['motorista']))
                 km_edit = st.number_input("KM Odômetro Correto", value=float(item['km_atual']), step=1.0)
+                status_edit = st.selectbox("Classificação do Registro", ["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"], index=["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"].index(item['status_registro']) if item['status_registro'] in ["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"] else 0)
             with col_e2:
                 try:
                     data_val = datetime.datetime.strptime(item['data'], "%Y-%m-%d").date()
@@ -605,11 +615,11 @@ elif menu == "✏️ Corrigir / Editar Lançamento":
                 c = conn.cursor()
                 c.execute("""
                     UPDATE abastecimentos 
-                    SET data = ?, prefixo = ?, motorista = ?, km_atual = ?, litros_liberados = ?, observacao = ?
+                    SET data = ?, prefixo = ?, motorista = ?, km_atual = ?, litros_liberados = ?, status_registro = ?, observacao = ?
                     WHERE id = ?
-                """, (data_edit.strftime("%Y-%m-%d"), vtr_edit, mot_edit, km_edit, litros_edit, obs_edit, reg_id))
+                """, (data_edit.strftime("%Y-%m-%d"), vtr_edit, mot_edit, km_edit, litros_edit, status_edit, obs_edit, reg_id))
                 conn.commit()
-                st.success("✅ Registro atualizado com sucesso! As revisões e os relatórios foram recalculados.")
+                st.success("✅ Registro atualizado com sucesso! Os relatórios foram recalculados.")
                 st.rerun()
                 
             if excluir:
@@ -711,62 +721,96 @@ elif menu == "📋 Livro de Ocorrências / Avarias":
     df_oc = pd.read_sql_query("SELECT data_hora as Data, prefixo as Viatura, tipo as Tipo, motorista as Envolvido, descricao as Detalhes FROM ocorrencias ORDER BY id DESC", conn)
     st.dataframe(df_oc, use_container_width=True)
 
-# 7. CONSULTA, FOTOS & EXPORTAÇÃO
+# 7. CONSULTA, FOTOS & EXPORTAÇÃO SEPARADA
 elif menu == "🔎 Consulta, Fotos & Exportação":
-    st.subheader("🔎 Busca Avançada, Consulta de Fotos e Exportação")
+    st.subheader("🔎 Consulta Separada por Categoria e Exportação")
     
     df_abast = pd.read_sql_query("""
         SELECT id, data as Data, prefixo as Viatura, motorista as Motorista, 
                km_atual as [KM Odômetro], litros_liberados as [Qtd Liberada], 
-               horario as Horário, status_registro as [Status/Tipo], 
+               horario as Horário, status_registro as [Tipo Evento], 
                observacao as [Motivo/Obs], foto_painel
         FROM abastecimentos 
         ORDER BY data DESC, id DESC
     """, conn)
     
     if not df_abast.empty:
-        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        # Filtros no topo
+        col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
-            filtro_vtr = st.selectbox("Viatura", ["Todas"] + list(df_abast['Viatura'].unique()))
+            filtro_vtr = st.selectbox("Filtrar Viatura", ["Todas"] + list(df_abast['Viatura'].unique()))
         with col_f2:
-            filtro_status = st.selectbox("Status", ["Todos", "Abastecido", "Não Abasteceu (N/A)", "Assunção de Serviço"])
+            filtro_motorista = st.text_input("Filtrar Motorista")
         with col_f3:
-            filtro_motorista = st.text_input("Motorista")
-        with col_f4:
-            filtro_data = st.date_input("Data Específica", value=None)
+            filtro_data = st.date_input("Filtrar Data Específica", value=None)
             
         df_filtrado = df_abast.copy()
         if filtro_vtr != "Todas":
             df_filtrado = df_filtrado[df_filtrado['Viatura'] == filtro_vtr]
-        if filtro_status != "Todos":
-            df_filtrado = df_filtrado[df_filtrado['Status/Tipo'] == filtro_status]
         if filtro_motorista:
             df_filtrado = df_filtrado[df_filtrado['Motorista'].str.contains(filtro_motorista, case=False, na=False)]
         if filtro_data is not None:
             df_filtrado = df_filtrado[df_filtrado['Data'] == filtro_data.strftime("%Y-%m-%d")]
-            
-        st.write(f"**Registros encontrados:** {len(df_filtrado)}")
+
+        # Divisão em Abas Separadas para NÃO MISTURAR
+        tab_abast, tab_assuncao, tab_nao, tab_todos = st.tabs([
+            "⛽ Abastecimentos Reais", 
+            "🕒 Assunção de Serviço (KM Inicial)", 
+            "🚫 Não Abasteceu (N/A)", 
+            "📋 Todos os Eventos"
+        ])
         
         colunas_exibir = [c for c in df_filtrado.columns if c not in ['id', 'foto_painel']]
-        st.dataframe(df_filtrado[colunas_exibir], use_container_width=True)
         
-        registros_com_foto = df_filtrado[df_filtrado['foto_painel'].notna() & (df_filtrado['foto_painel'] != '')]
-        if not registros_com_foto.empty:
-            st.write("---")
-            st.write("#### 📸 Comprovações Fotográficas dos Painéis")
-            cols_grid = st.columns(3)
-            for idx, (_, row_foto) in enumerate(registros_com_foto.iterrows()):
-                c_idx = idx % 3
-                if os.path.exists(str(row_foto['foto_painel'])):
-                    with cols_grid[c_idx]:
-                        st.image(row_foto['foto_painel'], caption=f"{row_foto['Viatura']} - {row_foto['Data']} ({row_foto['KM Odômetro']} km)\nMotorista: {row_foto['Motorista']}", use_container_width=True)
+        with tab_abast:
+            df_aba_abast = df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido']
+            st.write(f"**Total de Abastecimentos Registrados:** {len(df_aba_abast)}")
+            st.dataframe(df_aba_abast[colunas_exibir], use_container_width=True)
+            
+            # Galeria de fotos de abastecimento
+            fotos_abast = df_aba_abast[df_aba_abast['foto_painel'].notna() & (df_aba_abast['foto_painel'] != '')]
+            if not fotos_abast.empty:
+                st.write("##### 📸 Comprovações Fotográficas dos Abastecimentos")
+                cols = st.columns(3)
+                for idx, (_, r_f) in enumerate(fotos_abast.iterrows()):
+                    if os.path.exists(str(r_f['foto_painel'])):
+                        with cols[idx % 3]:
+                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} ({r_f['KM Odômetro']} km | {r_f['Qtd Liberada']})", use_container_width=True)
+
+        with tab_assuncao:
+            df_aba_assuncao = df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço']
+            st.write(f"**Total de Entradas de Plantão (KM Inicial):** {len(df_aba_assuncao)}")
+            st.dataframe(df_aba_assuncao[colunas_exibir], use_container_width=True)
+            
+            # Galeria de fotos de assunção
+            fotos_assuncao = df_aba_assuncao[df_aba_assuncao['foto_painel'].notna() & (df_aba_assuncao['foto_painel'] != '')]
+            if not fotos_assuncao.empty:
+                st.write("##### 📸 Fotos de Painel na Entrada do Turno")
+                cols = st.columns(3)
+                for idx, (_, r_f) in enumerate(fotos_assuncao.iterrows()):
+                    if os.path.exists(str(r_f['foto_painel'])):
+                        with cols[idx % 3]:
+                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} (KM Inicial: {r_f['KM Odômetro']})", use_container_width=True)
+
+        with tab_nao:
+            df_aba_nao = df_filtrado[df_filtrado['Tipo Evento'] == 'Não Abasteceu (N/A)']
+            st.write(f"**Total de Justificativas (Sem Abastecer):** {len(df_aba_nao)}")
+            st.dataframe(df_aba_nao[colunas_exibir], use_container_width=True)
+
+        with tab_todos:
+            st.write(f"**Histórico Completo Consolidado:** {len(df_filtrado)}")
+            st.dataframe(df_filtrado[colunas_exibir], use_container_width=True)
         
         st.write("---")
-        excel_bytes = converter_df_para_excel(df_filtrado[colunas_exibir])
+        # Exportação com 2 abas no Excel
+        excel_bytes = converter_dfs_para_excel_multiplas_abas(
+            df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido'][colunas_exibir],
+            df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço'][colunas_exibir]
+        )
         st.download_button(
-            label="📥 Baixar Relatório em Excel (.xlsx)",
+            label="📥 Baixar Planilha Excel Organizada (Abas Separadas: Abastecimento e Assunção)",
             data=excel_bytes,
-            file_name="Relatorio_Geral_Frota_10CICOM.xlsx",
+            file_name="Relatorio_Frota_10CICOM_Abas_Separadas.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
