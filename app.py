@@ -6,6 +6,19 @@ import datetime
 import docx
 import os
 import io
+import re
+from PIL import Image
+
+# Tenta carregar OCR (easyocr ou pytesseract se disponível)
+try:
+    import easyocr
+    OCR_ENGINE = "easyocr"
+except ImportError:
+    try:
+        import pytesseract
+        OCR_ENGINE = "pytesseract"
+    except ImportError:
+        OCR_ENGINE = "manual"
 
 # Configuração da Página
 st.set_page_config(page_title="Gestão de Frota - 10ª CICOM", layout="wide", page_icon="🚔")
@@ -39,7 +52,92 @@ def check_login():
         return False
     return True
 
-# --- COMPONENTE DE DITADO POR VOZ (SPEECH-TO-TEXT) ---
+# --- EXTRAÇÃO DE TEXTO DO PRINT / FOTO (OCR + REGEX) ---
+@st.cache_resource
+def carregar_leitor_ocr():
+    if OCR_ENGINE == "easyocr":
+        return easyocr.Reader(['pt', 'en'], gpu=False)
+    return None
+
+def extrair_texto_imagem(imagem_bytes):
+    texto_completo = ""
+    if OCR_ENGINE == "easyocr":
+        reader = carregar_leitor_ocr()
+        resultados = reader.readtext(imagem_bytes.getvalue(), detail=0)
+        texto_completo = " ".join(resultados)
+    elif OCR_ENGINE == "pytesseract":
+        img = Image.open(imagem_bytes)
+        texto_completo = pytesseract.image_to_string(img, lang='por')
+    return texto_completo
+
+def interpretar_dados_mensagem(texto):
+    dados = {
+        "prefixo": "25-1001",
+        "motorista": "",
+        "km_atual": 0.0,
+        "autonomia": 0.0,
+        "tipo_operacao": "⛽ Realizar Abastecimento",
+        "status_registro": "Abastecido"
+    }
+    
+    if not texto:
+        return dados
+        
+    texto_clean = texto.upper()
+    
+    # 1. Identifica Prefixo da Viatura
+    if "1001" in texto_clean or "25-1001" in texto_clean:
+        dados["prefixo"] = "25-1001"
+    elif "1111" in texto_clean or "25-1111" in texto_clean:
+        dados["prefixo"] = "25-1111"
+    elif "1329" in texto_clean or "25-1329" in texto_clean:
+        dados["prefixo"] = "25-1329"
+    elif "1353" in texto_clean or "25-1353" in texto_clean:
+        dados["prefixo"] = "25-1353"
+    elif "1394" in texto_clean or "25-1394" in texto_clean:
+        dados["prefixo"] = "25-1394"
+
+    # 2. Identifica KM / Odômetro
+    match_km = re.search(r'(?:KM|ODO|ODÔMETRO|INICIAL)[\s:\.\-]*([0-9]{2,6}(?:[\.,][0-9]{1,3})?)', texto_clean)
+    if match_km:
+        num_str = match_km.group(1).replace('.', '').replace(',', '.')
+        try:
+            dados["km_atual"] = float(num_str)
+        except ValueError:
+            pass
+    else:
+        # Tenta pegar qualquer número de 4 a 6 dígitos
+        match_numeros = re.findall(r'\b[0-9]{4,6}\b', texto_clean)
+        if match_numeros:
+            for num in match_numeros:
+                if num not in ["1001", "1111", "1329", "1353", "1394"]:
+                    dados["km_atual"] = float(num)
+                    break
+
+    # 3. Identifica Motorista / Farol
+    match_mot = re.search(r'(?:MOTORISTA|CONDUTOR|FAROL|SD|CB|SGT|SUB|TEN|CAP)[\s:\.\-]*([A-Z\s]+?)(?=\n|KM|VTR|AUTO|$)', texto_clean)
+    if match_mot:
+        dados["motorista"] = match_mot.group(0).strip().title()
+
+    # 4. Identifica Autonomia
+    match_auto = re.search(r'(?:AUTONOMIA|AUTO)[\s:\.\-]*([0-9]{1,4})', texto_clean)
+    if match_auto:
+        try:
+            dados["autonomia"] = float(match_auto.group(1))
+        except ValueError:
+            pass
+            
+    # 5. Verifica se é Assunção ou Não Abasteceu
+    if "ASSUNÇÃO" in texto_clean or "ENTRADA" in texto_clean or "INÍCIO" in texto_clean:
+        dados["tipo_operacao"] = "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)"
+        dados["status_registro"] = "Assunção de Serviço"
+    elif "NÃO ABASTECEU" in texto_clean or "N/A" in texto_clean:
+        dados["tipo_operacao"] = "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"
+        dados["status_registro"] = "Não Abasteceu (N/A)"
+
+    return dados
+
+# --- COMPONENTE DE DITADO POR VOZ ---
 def componente_ditado_voz(chave_id="transcricao_box"):
     html_code = f"""
     <div style="background-color: #f0f2f6; border-radius: 8px; padding: 12px; margin-bottom: 10px; font-family: sans-serif;">
@@ -204,6 +302,7 @@ with st.sidebar:
     st.write("Gestão Operacional de Frota")
     menu = st.radio("Navegação", [
         "📊 Painel de Controle (Dashboard)",
+        "🤖 Leitura Automática de Print (OCR)",
         "📸 Check-in & Abastecimento", 
         "✏️ Corrigir / Editar Lançamento",
         "🛠️ Status da Frota & Revisões", 
@@ -264,7 +363,102 @@ if menu == "📊 Painel de Controle (Dashboard)":
     else:
         st.info("Nenhum registro cadastrado no momento.")
 
-# 2. CHECK-IN & ABASTECIMENTO
+# 2. LEITURA AUTOMÁTICA DE PRINT / WHATSAPP (OCR)
+elif menu == "🤖 Leitura Automática de Print (OCR)":
+    st.subheader("🤖 Leitura Automática de Print do WhatsApp ou Foto do Painel")
+    st.write("Envie o **print da conversa do WhatsApp** (com a foto e o texto) ou cole a mensagem. O sistema lerá tudo e preencherá os campos automaticamente.")
+    
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        print_upload = st.file_uploader("Selecione o Print / Foto do WhatsApp", type=["jpg", "jpeg", "png"])
+    with col_up2:
+        texto_colado = st.text_area("Ou Cole o Texto do WhatsApp aqui (Opcional):", placeholder="Ex: VTR 25-1001, Cb Silva, KM: 45200, Autonomia 65km")
+        
+    dados_extraidos = {
+        "prefixo": "25-1001",
+        "motorista": "",
+        "km_atual": 0.0,
+        "autonomia": 0.0,
+        "tipo_operacao": "⛽ Realizar Abastecimento",
+        "status_registro": "Abastecido"
+    }
+
+    if print_upload is not None:
+        st.image(print_upload, caption="Print / Imagem Carregada", width=300)
+        with st.spinner("🤖 Analisando imagem e extraindo texto com OCR..."):
+            texto_ocr = extrair_texto_imagem(print_upload)
+            texto_combinado = f"{texto_ocr} {texto_colado}"
+            dados_extraidos = interpretar_dados_mensagem(texto_combinado)
+            if texto_ocr:
+                st.success("✅ Texto lido com sucesso pela imagem!")
+                with st.expander("Ver texto detectado pelo OCR"):
+                    st.write(texto_ocr)
+    elif texto_colado:
+        dados_extraidos = interpretar_dados_mensagem(texto_colado)
+
+    st.write("---")
+    st.write("#### 📝 Conferência dos Dados Extraídos (Confirme antes de Gravar)")
+    
+    with st.form("form_ocr_confirmar"):
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            lista_vtrs = ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"]
+            idx_vtr = lista_vtrs.index(dados_extraidos["prefixo"]) if dados_extraidos["prefixo"] in lista_vtrs else 0
+            prefixo_conf = st.selectbox("Prefixo da Viatura", lista_vtrs, index=idx_vtr)
+            motorista_conf = st.text_input("Motorista", value=dados_extraidos["motorista"])
+            km_conf = st.number_input("KM Odômetro", value=dados_extraidos["km_atual"], step=1.0)
+        with col_c2:
+            data_conf = st.date_input("Data", datetime.date.today())
+            hora_conf = st.time_input("Horário", datetime.datetime.now().time())
+            tipo_conf = st.selectbox("Tipo de Registro", [
+                "⛽ Realizar Abastecimento", 
+                "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)",
+                "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"
+            ], index=["⛽ Realizar Abastecimento", "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)", "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"].index(dados_extraidos["tipo_operacao"]))
+            autonomia_conf = st.number_input("Autonomia informada (km)", value=dados_extraidos["autonomia"], step=1.0)
+
+        # Regra de cálculo de cota
+        liberado = True
+        litros = "0L"
+        obs = "Lançamento via Leitura Automática (OCR)"
+        if tipo_conf == "⛽ Realizar Abastecimento":
+            if prefixo_conf in ["25-1001", "25-1111"]:
+                if 0 < autonomia_conf <= 70:
+                    litros = "60L"
+                elif 70 < autonomia_conf <= 180:
+                    litros = "50L"
+                else:
+                    litros = "0L"
+            else:
+                if 0 < autonomia_conf <= 70:
+                    litros = "40L"
+                elif 95 <= autonomia_conf <= 115:
+                    litros = "30L"
+                elif 115 < autonomia_conf <= 125:
+                    litros = "35L"
+                else:
+                    litros = "0L"
+        elif tipo_conf == "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)":
+            litros = "N/A"
+            obs = "Não Abasteceu (N/A)"
+
+        gravar_ocr = st.form_submit_button("💾 Confirmar e Gravar no Sistema", use_container_width=True)
+        if gravar_ocr:
+            if not motorista_conf:
+                st.warning("Preencha o nome do motorista.")
+            else:
+                caminho_foto = salvar_foto(print_upload, prefixo_conf, "OCR")
+                c = conn.cursor()
+                c.execute("""
+                    INSERT OR IGNORE INTO abastecimentos 
+                    (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, foto_painel, observacao) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (data_conf.strftime("%Y-%m-%d"), prefixo_conf, motorista_conf, km_conf, litros, hora_conf.strftime("%H:%M"), tipo_conf.split()[1], caminho_foto, obs))
+                conn.commit()
+                st.success("✅ Registro gravado com sucesso no banco de dados!")
+                st.rerun()
+
+# 3. CHECK-IN & ABASTECIMENTO MANUAL
 elif menu == "📸 Check-in & Abastecimento":
     st.subheader("📸 Registro Diário do Motorista: Assunção ou Abastecimento")
     
@@ -371,7 +565,7 @@ elif menu == "📸 Check-in & Abastecimento":
             conn.commit()
             st.success(f"✅ Registro de **{status_reg}** gravado com sucesso!")
 
-# 3. CORRIGIR / EDITAR LANÇAMENTO
+# 4. CORRIGIR / EDITAR LANÇAMENTO
 elif menu == "✏️ Corrigir / Editar Lançamento":
     st.subheader("✏️ Correção e Edição de Lançamentos Anteriores")
     st.info("Caso o motorista tenha digitado o KM ou o prefixo errado, selecione o registro abaixo para corrigir:")
@@ -427,7 +621,7 @@ elif menu == "✏️ Corrigir / Editar Lançamento":
     else:
         st.info("Nenhum lançamento encontrado para edição.")
 
-# 4. STATUS & REVISÕES
+# 5. STATUS & REVISÕES
 elif menu == "🛠️ Status da Frota & Revisões":
     st.subheader("🛠️ Monitoramento de Manutenção Preventiva")
     df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
@@ -460,7 +654,7 @@ elif menu == "🛠️ Status da Frota & Revisões":
     
     st.dataframe(df_vtr[['prefixo', 'modelo', 'placa', 'status', 'KM Atual', 'km_proxima_revisao', 'KM Restante p/ Revisão', 'Status Revisão']], use_container_width=True)
 
-# 5. OCORRÊNCIAS / AVARIAS
+# 6. OCORRÊNCIAS / AVARIAS
 elif menu == "📋 Livro de Ocorrências / Avarias":
     st.subheader("📋 Registro de Alterações, Arranhões e Sinistros")
     tab1, tab2 = st.tabs(["✍️ Digitação & Voz", "📄 Importar do Word (.docx)"])
@@ -517,7 +711,7 @@ elif menu == "📋 Livro de Ocorrências / Avarias":
     df_oc = pd.read_sql_query("SELECT data_hora as Data, prefixo as Viatura, tipo as Tipo, motorista as Envolvido, descricao as Detalhes FROM ocorrencias ORDER BY id DESC", conn)
     st.dataframe(df_oc, use_container_width=True)
 
-# 6. CONSULTA, FOTOS & EXPORTAÇÃO
+# 7. CONSULTA, FOTOS & EXPORTAÇÃO
 elif menu == "🔎 Consulta, Fotos & Exportação":
     st.subheader("🔎 Busca Avançada, Consulta de Fotos e Exportação")
     
@@ -578,7 +772,7 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
     else:
         st.info("Nenhum dado encontrado.")
 
-# 7. IMPORTAR PLANILHA EXCEL
+# 8. IMPORTAR PLANILHA EXCEL
 elif menu == "📥 Importar Planilha Excel":
     st.subheader("📥 Importar Dados de Planilha de Abastecimento (.xlsx)")
     arquivo_excel = st.file_uploader("Selecione o arquivo Excel", type=["xlsx", "xls", "XLSX", "XLS"])
