@@ -10,7 +10,7 @@ import io
 import re
 from PIL import Image
 
-# Tenta carregar OCR (easyocr ou pytesseract se disponível)
+# Configuração de Motor OCR
 try:
     import easyocr
     OCR_ENGINE = "easyocr"
@@ -21,7 +21,7 @@ except ImportError:
     except ImportError:
         OCR_ENGINE = "manual"
 
-# Configuração de Fuso Horário de Manaus (UTC-4)
+# Configuração de Fuso Horário Oficial de Manaus (UTC-4)
 TZ_MANAUS = zoneinfo.ZoneInfo("America/Manaus")
 
 def get_agora_manaus():
@@ -34,7 +34,7 @@ DB_FILE = "frota_10cicom.db"
 FOTOS_DIR = "fotos_paineis"
 os.makedirs(FOTOS_DIR, exist_ok=True)
 
-# --- CONTROLE DE ACESSO (LOGIN) ---
+# --- CONTROLE DE ACESSO ---
 SENHA_PADRAO = "10cicom"
 
 def check_login():
@@ -59,7 +59,7 @@ def check_login():
         return False
     return True
 
-# --- EXTRAÇÃO DE TEXTO DO PRINT / FOTO (OCR + REGEX) ---
+# --- OCR E EXTRAÇÃO ---
 @st.cache_resource
 def carregar_leitor_ocr():
     if OCR_ENGINE == "easyocr":
@@ -93,7 +93,7 @@ def interpretar_dados_mensagem(texto):
         
     texto_clean = texto.upper()
     
-    # 1. Prefixo da Viatura
+    # 1. Prefixo
     if "1001" in texto_clean or "25-1001" in texto_clean:
         dados["prefixo"] = "25-1001"
     elif "1111" in texto_clean or "25-1111" in texto_clean:
@@ -121,12 +121,12 @@ def interpretar_dados_mensagem(texto):
                     dados["km_atual"] = float(num)
                     break
 
-    # 3. Motorista / Farol
+    # 3. Motorista
     match_mot = re.search(r'(?:MOTORISTA|CONDUTOR|FAROL|SD|CB|SGT|SUB|TEN|CAP)[\s:\.\-]*([A-Z\s]+?)(?=\n|KM|VTR|AUTO|LITRO|$)', texto_clean)
     if match_mot:
         dados["motorista"] = match_mot.group(0).strip().title()
 
-    # 4. Litros Abastecidos
+    # 4. Litros
     match_litros = re.search(r'(?:LITRO|LITROS|LT|LTS|QTD|QUANTIDADE)[\s:\.\-]*([0-9]{1,3}(?:[\.,][0-9]{1,2})?)', texto_clean)
     if match_litros:
         try:
@@ -142,7 +142,7 @@ def interpretar_dados_mensagem(texto):
         except ValueError:
             pass
             
-    # 6. Classificação do Tipo de Operação
+    # 6. Tipo de Operação
     if "ASSUNÇÃO" in texto_clean or "ENTRADA" in texto_clean or "INÍCIO" in texto_clean or "INICIO" in texto_clean:
         dados["tipo_operacao"] = "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)"
         dados["status_registro"] = "Assunção de Serviço"
@@ -212,7 +212,7 @@ def componente_ditado_voz(chave_id="transcricao_box"):
             }};
         }} else {{
             btnRec.disabled = true;
-            statusTxt.innerText = 'Navegador sem suporte a Web Speech API. Utilize o microfone do teclado.';
+            statusTxt.innerText = 'Navegador sem suporte a Web Speech API. Utilize o teclado.';
         }}
 
         btnCopiar.onclick = () => {{
@@ -304,7 +304,6 @@ with st.sidebar:
     st.title("🚔 10ª CICOM")
     st.write("Gestão Operacional de Frota")
     
-    # Exibe a data/hora oficial de Manaus no menu
     agora_m = get_agora_manaus()
     st.info(f"🕒 **Manaus (AM):** {agora_m.strftime('%d/%m/%Y %H:%M')}")
     
@@ -332,7 +331,7 @@ if menu == "📊 Painel de Controle (Dashboard)":
     df_vtr_rev = pd.read_sql_query("SELECT * FROM viaturas", conn)
     for _, r_v in df_vtr_rev.iterrows():
         pref = r_v['prefixo']
-        res = conn.execute("SELECT km_atual FROM abastecimentos WHERE prefixo = ? AND km_atual > 0 ORDER BY km_atual DESC LIMIT 1", (pref,)).fetchone()
+        res = conn.execute("SELECT km_atual FROM abastecimentos WHERE prefixo = ? AND km_atual > 0 ORDER BY data DESC, horario DESC, km_atual DESC LIMIT 1", (pref,)).fetchone()
         km_at = res[0] if res else 0.0
         km_rest = r_v['km_proxima_revisao'] - km_at
         if r_v['status'] == 'Ativa' and km_rest <= 500 and km_at > 0:
@@ -340,7 +339,7 @@ if menu == "📊 Painel de Controle (Dashboard)":
         elif r_v['status'] == 'Ativa' and km_rest <= 1500 and km_at > 0:
             st.warning(f"⚠️ **ATENÇÃO:** Viatura **{pref}** ({r_v['modelo']}) está próxima da revisão ({km_rest:.0f} km restantes).")
 
-    df_abast = pd.read_sql_query("SELECT * FROM abastecimentos", conn)
+    df_abast = pd.read_sql_query("SELECT * FROM abastecimentos ORDER BY data DESC, horario DESC", conn)
     df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
     
     if not df_abast.empty:
@@ -375,7 +374,7 @@ if menu == "📊 Painel de Controle (Dashboard)":
 # 2. LEITURA AUTOMÁTICA DE PRINT / WHATSAPP (OCR)
 elif menu == "🤖 Leitura Automática de Print (OCR)":
     st.subheader("🤖 Leitura Automática de Print do WhatsApp ou Foto do Painel")
-    st.write("Envie o print ou cole a mensagem. O sistema define a data e horário oficiais de Manaus automaticamente.")
+    st.write("Envie o print ou cole o texto. O sistema ajusta a data e horário no fuso de Manaus.")
     
     col_up1, col_up2 = st.columns(2)
     with col_up1:
@@ -426,7 +425,6 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
             ], index=["⛽ Realizar Abastecimento", "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)", "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"].index(dados_extraidos["tipo_operacao"]))
             
         with col_c2:
-            # Horário e data padrão no fuso de Manaus
             data_conf = st.date_input("Data do Registro", agora_manaus.date())
             hora_conf = st.time_input("Horário do Registro (Manaus)", agora_manaus.time())
             
@@ -448,7 +446,6 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
             if litros_manual_ocr > 0:
                 litros = f"{litros_manual_ocr:.1f}L".replace(".0L", "L")
             else:
-                # Caso não tenha digitado litros, calcula pela autonomia
                 if prefixo_conf in ["25-1001", "25-1111"]:
                     if 0 < autonomia_conf <= 70:
                         litros = "60L"
@@ -501,7 +498,6 @@ elif menu == "📸 Check-in & Abastecimento":
     ], horizontal=True)
     
     st.write("---")
-    
     agora_manaus = get_agora_manaus()
     
     col1, col2 = st.columns(2)
@@ -550,7 +546,6 @@ elif menu == "📸 Check-in & Abastecimento":
             litros = f"{litros_digitados:.1f}L".replace(".0L", "L")
             st.success(f"✅ Quantidade Informada: **{litros}** para a viatura {prefixo}.")
         else:
-            # Cálculo pela Autonomia se não digitou os litros
             if prefixo in ["25-1001", "25-1111"]:
                 if 0 < autonomia <= 70:
                     liberado = True
@@ -620,7 +615,7 @@ elif menu == "✏️ Corrigir / Editar Lançamento":
     st.subheader("✏️ Correção e Edição de Lançamentos Anteriores")
     st.info("Ajuste horários, quilometragens ou quantidades de litros de lançamentos passados:")
     
-    df_todos = pd.read_sql_query("SELECT id, data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao FROM abastecimentos ORDER BY id DESC", conn)
+    df_todos = pd.read_sql_query("SELECT id, data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao FROM abastecimentos ORDER BY data DESC, horario DESC, id DESC", conn)
     
     if not df_todos.empty:
         opcoes_regs = [f"ID {r['id']} | [{r['status_registro']}] {r['data']} {r['horario']} | VTR: {r['prefixo']} | KM: {r['km_atual']} | Litros: {r['litros_liberados']} | Mot: {r['motorista']}" for _, r in df_todos.iterrows()]
@@ -689,7 +684,7 @@ elif menu == "🛠️ Status da Frota & Revisões":
     alertas = []
     for _, row in df_vtr.iterrows():
         pref = row['prefixo']
-        res = conn.execute("SELECT km_atual FROM abastecimentos WHERE prefixo = ? AND km_atual > 0 ORDER BY km_atual DESC LIMIT 1", (pref,)).fetchone()
+        res = conn.execute("SELECT km_atual FROM abastecimentos WHERE prefixo = ? AND km_atual > 0 ORDER BY data DESC, horario DESC, km_atual DESC LIMIT 1", (pref,)).fetchone()
         km_atual = res[0] if res else 0.0
         prox_rev = row['km_proxima_revisao']
         km_restante = prox_rev - km_atual
@@ -771,8 +766,9 @@ elif menu == "📋 Livro de Ocorrências / Avarias":
 
 # 7. CONSULTA, FOTOS & EXPORTAÇÃO
 elif menu == "🔎 Consulta, Fotos & Exportação":
-    st.subheader("🔎 Consulta Separada por Categoria e Exportação")
+    st.subheader("🔎 Consulta em Ordem Cronológica e Exportação")
     
+    # Ordem cronológica: mais recente primeiro na visualização em tela
     df_abast = pd.read_sql_query("""
         SELECT id, data as Data, prefixo as Viatura, motorista as Motorista, 
                km_atual as [KM Odômetro], litros_liberados as [Qtd Liberada], 
@@ -846,14 +842,16 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
             st.dataframe(df_filtrado[colunas_exibir], use_container_width=True)
         
         st.write("---")
-        excel_bytes = converter_dfs_para_excel_multiplas_abas(
-            df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido'][colunas_exibir],
-            df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço'][colunas_exibir]
-        )
+        
+        # Ordenação cronológica linear (do dia 1 ao 31) para o Excel baixado
+        df_exp_abast = df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido'][colunas_exibir].sort_values(by=['Data', 'Horário'], ascending=[True, True])
+        df_exp_assuncao = df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço'][colunas_exibir].sort_values(by=['Data', 'Horário'], ascending=[True, True])
+        
+        excel_bytes = converter_dfs_para_excel_multiplas_abas(df_exp_abast, df_exp_assuncao)
         st.download_button(
-            label="📥 Baixar Planilha Excel Organizada (Abas Separadas)",
+            label="📥 Baixar Planilha Excel Organizada (Ordem Cronológica)",
             data=excel_bytes,
-            file_name="Relatorio_Frota_10CICOM_Abas_Separadas.xlsx",
+            file_name="Relatorio_Frota_10CICOM_Cronologico.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
@@ -862,6 +860,23 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
 # 8. IMPORTAR PLANILHA EXCEL
 elif menu == "📥 Importar Planilha Excel":
     st.subheader("📥 Importar Dados de Planilha de Abastecimento (.xlsx)")
+    st.write("O sistema verifica e ignora automaticamente qualquer registro que já exista no banco.")
+
+    if st.button("🧹 Executar Faxina de Registros Duplicados no Banco"):
+        c = conn.cursor()
+        c.execute("""
+            DELETE FROM abastecimentos 
+            WHERE id NOT IN (
+                SELECT MIN(id) 
+                FROM abastecimentos 
+                GROUP BY data, prefixo, km_atual, horario, status_registro
+            )
+        """)
+        conn.commit()
+        st.success("✅ Banco de dados limpo! Todas as duplicidades foram removidas.")
+        st.rerun()
+
+    st.write("---")
     arquivo_excel = st.file_uploader("Selecione o arquivo Excel", type=["xlsx", "xls", "XLSX", "XLS"])
     
     if arquivo_excel is not None:
@@ -872,9 +887,23 @@ elif menu == "📥 Importar Planilha Excel":
             
             c = conn.cursor()
             novos = 0
+            duplicados_ignorados = 0
+            
             for col in date_cols:
                 d_val = raw_df.iloc[2, col]
-                data_str = d_val.strftime("%Y-%m-%d") if isinstance(d_val, pd.Timestamp) else str(d_val)[:10]
+                if isinstance(d_val, pd.Timestamp):
+                    data_str = d_val.strftime("%Y-%m-%d")
+                else:
+                    d_s = str(d_val).strip()[:10]
+                    if '/' in d_s:
+                        partes = d_s.split('/')
+                        if len(partes) == 3:
+                            data_str = f"{partes[2]}-{partes[1].zfill(2)}-{partes[0].zfill(2)}"
+                        else:
+                            data_str = d_s
+                    else:
+                        data_str = d_s
+                
                 for r, prefixo in vtr_rows.items():
                     km = raw_df.iloc[r, col]
                     motorista = raw_df.iloc[r, col+1] if col+1 < len(raw_df.columns) else ""
@@ -893,17 +922,31 @@ elif menu == "📥 Importar Planilha Excel":
                         except ValueError:
                             status_impor = "Não Abasteceu (N/A)"
                             
-                    c.execute("""
-                        INSERT OR IGNORE INTO abastecimentos 
-                        (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (data_str, prefixo, str(motorista).strip(), km_num, str(qtde).strip(), str(horario).strip(), status_impor, "Importado da Planilha"))
-                    if c.rowcount > 0:
+                    mot_clean = str(motorista).strip()
+                    qtde_clean = str(qtde).strip()
+                    hora_clean = str(horario).strip()
+                    
+                    existe = c.execute("""
+                        SELECT id FROM abastecimentos 
+                        WHERE data = ? AND prefixo = ? AND (km_atual = ? OR horario = ?)
+                    """, (data_str, prefixo, km_num, hora_clean)).fetchone()
+                    
+                    if not existe:
+                        c.execute("""
+                            INSERT INTO abastecimentos 
+                            (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (data_str, prefixo, mot_clean, km_num, qtde_clean, hora_clean, status_impor, "Importado da Planilha"))
                         novos += 1
+                    else:
+                        duplicados_ignorados += 1
+
             conn.commit()
+            
             if novos > 0:
-                st.success(f"Foram importados/atualizados {novos} registros!")
+                st.success(f"✅ Sucesso: {novos} novos registros importados! ({duplicados_ignorados} duplicados foram ignorados)")
+                st.rerun()
             else:
-                st.info("Nenhuma novidade encontrada (todos os registros já estavam gravados).")
+                st.info(f"ℹ️ Nenhum registro novo. Todos os {duplicados_ignorados} registros da planilha já constam no sistema.")
 
 conn.close()
