@@ -3,6 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
 import datetime
+import zoneinfo
 import docx
 import os
 import io
@@ -19,6 +20,12 @@ except ImportError:
         OCR_ENGINE = "pytesseract"
     except ImportError:
         OCR_ENGINE = "manual"
+
+# Configuração de Fuso Horário de Manaus (UTC-4)
+TZ_MANAUS = zoneinfo.ZoneInfo("America/Manaus")
+
+def get_agora_manaus():
+    return datetime.datetime.now(TZ_MANAUS)
 
 # Configuração da Página
 st.set_page_config(page_title="Gestão de Frota - 10ª CICOM", layout="wide", page_icon="🚔")
@@ -76,6 +83,7 @@ def interpretar_dados_mensagem(texto):
         "motorista": "",
         "km_atual": 0.0,
         "autonomia": 0.0,
+        "litros_digitados": 0.0,
         "tipo_operacao": "⛽ Realizar Abastecimento",
         "status_registro": "Abastecido"
     }
@@ -85,7 +93,7 @@ def interpretar_dados_mensagem(texto):
         
     texto_clean = texto.upper()
     
-    # 1. Identifica Prefixo da Viatura
+    # 1. Prefixo da Viatura
     if "1001" in texto_clean or "25-1001" in texto_clean:
         dados["prefixo"] = "25-1001"
     elif "1111" in texto_clean or "25-1111" in texto_clean:
@@ -97,7 +105,7 @@ def interpretar_dados_mensagem(texto):
     elif "1394" in texto_clean or "25-1394" in texto_clean:
         dados["prefixo"] = "25-1394"
 
-    # 2. Identifica KM / Odômetro
+    # 2. KM / Odômetro
     match_km = re.search(r'(?:KM|ODO|ODÔMETRO|INICIAL)[\s:\.\-]*([0-9]{2,6}(?:[\.,][0-9]{1,3})?)', texto_clean)
     if match_km:
         num_str = match_km.group(1).replace('.', '').replace(',', '.')
@@ -113,12 +121,20 @@ def interpretar_dados_mensagem(texto):
                     dados["km_atual"] = float(num)
                     break
 
-    # 3. Identifica Motorista / Farol
-    match_mot = re.search(r'(?:MOTORISTA|CONDUTOR|FAROL|SD|CB|SGT|SUB|TEN|CAP)[\s:\.\-]*([A-Z\s]+?)(?=\n|KM|VTR|AUTO|$)', texto_clean)
+    # 3. Motorista / Farol
+    match_mot = re.search(r'(?:MOTORISTA|CONDUTOR|FAROL|SD|CB|SGT|SUB|TEN|CAP)[\s:\.\-]*([A-Z\s]+?)(?=\n|KM|VTR|AUTO|LITRO|$)', texto_clean)
     if match_mot:
         dados["motorista"] = match_mot.group(0).strip().title()
 
-    # 4. Identifica Autonomia
+    # 4. Litros Abastecidos
+    match_litros = re.search(r'(?:LITRO|LITROS|LT|LTS|QTD|QUANTIDADE)[\s:\.\-]*([0-9]{1,3}(?:[\.,][0-9]{1,2})?)', texto_clean)
+    if match_litros:
+        try:
+            dados["litros_digitados"] = float(match_litros.group(1).replace(',', '.'))
+        except ValueError:
+            pass
+
+    # 5. Autonomia
     match_auto = re.search(r'(?:AUTONOMIA|AUTO)[\s:\.\-]*([0-9]{1,4})', texto_clean)
     if match_auto:
         try:
@@ -126,8 +142,8 @@ def interpretar_dados_mensagem(texto):
         except ValueError:
             pass
             
-    # 5. Classifica o Tipo de Operação
-    if "ASSUNÇÃO" in texto_clean or "ENTRADA" in texto_clean or "INÍCIO" in texto_clean:
+    # 6. Classificação do Tipo de Operação
+    if "ASSUNÇÃO" in texto_clean or "ENTRADA" in texto_clean or "INÍCIO" in texto_clean or "INICIO" in texto_clean:
         dados["tipo_operacao"] = "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)"
         dados["status_registro"] = "Assunção de Serviço"
     elif "NÃO ABASTECEU" in texto_clean or "N/A" in texto_clean:
@@ -258,25 +274,12 @@ def init_db():
     ]
     c.executemany("INSERT OR IGNORE INTO viaturas VALUES (?, ?, ?, ?, ?, ?, ?)", frota)
     
-    try:
-        c.execute("ALTER TABLE abastecimentos ADD COLUMN status_registro TEXT DEFAULT 'Abastecido'")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE abastecimentos ADD COLUMN foto_painel TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE abastecimentos ADD COLUMN observacao TEXT")
-    except sqlite3.OperationalError:
-        pass
-
     conn.commit()
     conn.close()
 
 def salvar_foto(foto_file, prefixo, tipo_evento):
     if foto_file is not None:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = get_agora_manaus().strftime("%Y%m%d_%H%M%S")
         nome_arquivo = f"{prefixo}_{tipo_evento}_{timestamp}.jpg"
         caminho = os.path.join(FOTOS_DIR, nome_arquivo)
         with open(caminho, "wb") as f:
@@ -300,6 +303,11 @@ if not check_login():
 with st.sidebar:
     st.title("🚔 10ª CICOM")
     st.write("Gestão Operacional de Frota")
+    
+    # Exibe a data/hora oficial de Manaus no menu
+    agora_m = get_agora_manaus()
+    st.info(f"🕒 **Manaus (AM):** {agora_m.strftime('%d/%m/%Y %H:%M')}")
+    
     menu = st.radio("Navegação", [
         "📊 Painel de Controle (Dashboard)",
         "🤖 Leitura Automática de Print (OCR)",
@@ -343,23 +351,22 @@ if menu == "📊 Painel de Controle (Dashboard)":
         total_litros = df_so_abast['litros_num'].sum()
         total_abast = len(df_so_abast[df_so_abast['litros_num'] > 0])
         total_assuncoes = len(df_abast[df_abast['status_registro'] == 'Assunção de Serviço'])
-        total_nao_abast = len(df_abast[df_abast['status_registro'] == 'Não Abasteceu (N/A)'])
         vtrs_ativas = len(df_vtr[df_vtr['status'] == 'Ativa'])
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Abastecimentos Realizados", f"{total_abast}")
         c2.metric("Assunções de Serviço (KM Inicial)", f"{total_assuncoes}")
-        c3.metric("Total Combustível", f"{total_litros:.0f} Litros")
+        c3.metric("Total Combustível", f"{total_litros:.1f} L")
         c4.metric("Viaturas Ativas", f"{vtrs_ativas}")
         
         st.write("---")
         cg1, cg2 = st.columns(2)
         with cg1:
-            st.write("##### ⛽ Consumo Real de Combustível por Viatura (Exclui KM Inicial)")
+            st.write("##### ⛽ Consumo de Combustível por Viatura (Litros)")
             consumo_vtr = df_so_abast.groupby('prefixo')['litros_num'].sum()
             st.bar_chart(consumo_vtr)
         with cg2:
-            st.write("##### 📈 Distribuição dos Registros da Unidade")
+            st.write("##### 📈 Distribuição dos Registros")
             status_cont = df_abast['status_registro'].value_counts()
             st.bar_chart(status_cont)
     else:
@@ -368,19 +375,20 @@ if menu == "📊 Painel de Controle (Dashboard)":
 # 2. LEITURA AUTOMÁTICA DE PRINT / WHATSAPP (OCR)
 elif menu == "🤖 Leitura Automática de Print (OCR)":
     st.subheader("🤖 Leitura Automática de Print do WhatsApp ou Foto do Painel")
-    st.write("Envie o **print da conversa do WhatsApp** (com a foto e o texto) ou cole a mensagem. O sistema separará automaticamente se é Abastecimento ou KM Inicial.")
+    st.write("Envie o print ou cole a mensagem. O sistema define a data e horário oficiais de Manaus automaticamente.")
     
     col_up1, col_up2 = st.columns(2)
     with col_up1:
         print_upload = st.file_uploader("Selecione o Print / Foto do WhatsApp", type=["jpg", "jpeg", "png"])
     with col_up2:
-        texto_colado = st.text_area("Ou Cole o Texto do WhatsApp aqui (Opcional):", placeholder="Ex: VTR 25-1001, Cb Silva, KM Inicial: 45200")
+        texto_colado = st.text_area("Ou Cole o Texto do WhatsApp aqui (Opcional):", placeholder="Ex: VTR 25-1001, Cb Silva, KM: 45200, Abastecido: 50L")
         
     dados_extraidos = {
         "prefixo": "25-1001",
         "motorista": "",
         "km_atual": 0.0,
         "autonomia": 0.0,
+        "litros_digitados": 0.0,
         "tipo_operacao": "⛽ Realizar Abastecimento",
         "status_registro": "Abastecido"
     }
@@ -399,8 +407,10 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
         dados_extraidos = interpretar_dados_mensagem(texto_colado)
 
     st.write("---")
-    st.write("#### 📝 Conferência dos Dados Extraídos (Confirme antes de Gravar)")
+    st.write("#### 📝 Conferência dos Dados Extraídos (Horário Oficial de Manaus)")
     
+    agora_manaus = get_agora_manaus()
+
     with st.form("form_ocr_confirmar"):
         col_c1, col_c2 = st.columns(2)
         with col_c1:
@@ -409,39 +419,52 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
             prefixo_conf = st.selectbox("Prefixo da Viatura", lista_vtrs, index=idx_vtr)
             motorista_conf = st.text_input("Motorista", value=dados_extraidos["motorista"])
             km_conf = st.number_input("KM Odômetro", value=dados_extraidos["km_atual"], step=1.0)
-        with col_c2:
-            data_conf = st.date_input("Data", datetime.date.today())
-            hora_conf = st.time_input("Horário", datetime.datetime.now().time())
             tipo_conf = st.selectbox("Tipo de Registro", [
                 "⛽ Realizar Abastecimento", 
                 "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)",
                 "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"
             ], index=["⛽ Realizar Abastecimento", "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)", "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"].index(dados_extraidos["tipo_operacao"]))
-            autonomia_conf = st.number_input("Autonomia informada (km)", value=dados_extraidos["autonomia"], step=1.0)
+            
+        with col_c2:
+            # Horário e data padrão no fuso de Manaus
+            data_conf = st.date_input("Data do Registro", agora_manaus.date())
+            hora_conf = st.time_input("Horário do Registro (Manaus)", agora_manaus.time())
+            
+            litros_manual_ocr = st.number_input(
+                "⛽ Litros Abastecidos na Bomba (Digite a quantidade exata)", 
+                min_value=0.0, 
+                max_value=120.0, 
+                value=float(dados_extraidos["litros_digitados"]), 
+                step=0.5
+            )
+            autonomia_conf = st.number_input("Autonomia informada no painel (km)", value=dados_extraidos["autonomia"], step=1.0)
 
-        liberado = True
         litros = "0L"
         status_reg_salvar = "Abastecido"
         obs = "Lançamento via Leitura Automática (OCR)"
         
         if tipo_conf == "⛽ Realizar Abastecimento":
             status_reg_salvar = "Abastecido"
-            if prefixo_conf in ["25-1001", "25-1111"]:
-                if 0 < autonomia_conf <= 70:
-                    litros = "60L"
-                elif 70 < autonomia_conf <= 180:
-                    litros = "50L"
-                else:
-                    litros = "0L"
+            if litros_manual_ocr > 0:
+                litros = f"{litros_manual_ocr:.1f}L".replace(".0L", "L")
             else:
-                if 0 < autonomia_conf <= 70:
-                    litros = "40L"
-                elif 95 <= autonomia_conf <= 115:
-                    litros = "30L"
-                elif 115 < autonomia_conf <= 125:
-                    litros = "35L"
+                # Caso não tenha digitado litros, calcula pela autonomia
+                if prefixo_conf in ["25-1001", "25-1111"]:
+                    if 0 < autonomia_conf <= 70:
+                        litros = "60L"
+                    elif 70 < autonomia_conf <= 180:
+                        litros = "50L"
+                    else:
+                        litros = "0L"
                 else:
-                    litros = "0L"
+                    if 0 < autonomia_conf <= 70:
+                        litros = "40L"
+                    elif 95 <= autonomia_conf <= 115:
+                        litros = "30L"
+                    elif 115 < autonomia_conf <= 125:
+                        litros = "35L"
+                    else:
+                        litros = "0L"
         elif tipo_conf == "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)":
             status_reg_salvar = "Assunção de Serviço"
             litros = "0L"
@@ -464,7 +487,7 @@ elif menu == "🤖 Leitura Automática de Print (OCR)":
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (data_conf.strftime("%Y-%m-%d"), prefixo_conf, motorista_conf, km_conf, litros, hora_conf.strftime("%H:%M"), status_reg_salvar, caminho_foto, obs))
                 conn.commit()
-                st.success(f"✅ Registro de **{status_reg_salvar}** gravado separadamente com sucesso!")
+                st.success(f"✅ Registro de **{status_reg_salvar}** ({litros}) gravado com o horário oficial de Manaus ({hora_conf.strftime('%H:%M')})!")
                 st.rerun()
 
 # 3. CHECK-IN & ABASTECIMENTO MANUAL
@@ -479,17 +502,29 @@ elif menu == "📸 Check-in & Abastecimento":
     
     st.write("---")
     
+    agora_manaus = get_agora_manaus()
+    
     col1, col2 = st.columns(2)
     with col1:
         prefixo = st.selectbox("Prefixo da Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"])
         motorista = st.text_input("Nome de Guerra do Motorista (Farol)")
         km_atual = st.number_input("Quilometragem (KM Odômetro no Painel)", min_value=0.0, step=1.0)
     with col2:
-        data = st.date_input("Data do Registro", datetime.date.today())
-        hora = st.time_input("Horário", datetime.datetime.now().time())
+        data = st.date_input("Data do Registro", agora_manaus.date())
+        hora = st.time_input("Horário do Registro (Manaus)", agora_manaus.time())
+        
         if tipo_operacao == "⛽ Realizar Abastecimento":
-            autonomia = st.number_input("Autonomia Restante informada no painel (km)", min_value=0.0, step=1.0)
+            litros_digitados = st.number_input(
+                "⛽ Litros Abastecidos na Bomba (Digite a quantidade exata)", 
+                min_value=0.0, 
+                max_value=120.0, 
+                value=0.0, 
+                step=0.5,
+                help="Digite os litros abastecidos. Caso deixe 0, o sistema calculará automaticamente pela autonomia."
+            )
+            autonomia = st.number_input("Autonomia Restante no painel (km)", min_value=0.0, step=1.0)
         else:
+            litros_digitados = 0.0
             autonomia = 0.0
 
     st.write("##### 📷 Foto do Painel da Viatura (Odômetro)")
@@ -510,32 +545,38 @@ elif menu == "📸 Check-in & Abastecimento":
         if prefixo == "25-1353":
             obs = "Viatura 25-1353 cedida/emprestada."
             st.error("⚠️ Viatura 25-1353 está cedida. Abastecimento bloqueado.")
-        elif prefixo in ["25-1001", "25-1111"]:
-            if 0 < autonomia <= 70:
-                liberado = True
-                litros = "60L"
-                st.success("✅ COTA LIBERADA: 60 Litros de Diesel (Autonomia <= 70km)")
-            elif 70 < autonomia <= 180:
-                liberado = True
-                litros = "50L"
-                st.success("✅ COTA LIBERADA: 50 Litros de Diesel (Autonomia até 180km)")
-            else:
-                st.error(f"❌ Bloqueado: Autonomia ({autonomia}km) acima do limite permitido (>180km).")
+        elif litros_digitados > 0:
+            liberado = True
+            litros = f"{litros_digitados:.1f}L".replace(".0L", "L")
+            st.success(f"✅ Quantidade Informada: **{litros}** para a viatura {prefixo}.")
         else:
-            if 0 < autonomia <= 70:
-                liberado = True
-                litros = "40L"
-                st.success("✅ COTA LIBERADA: 40 Litros de Gasolina (Autonomia <= 70km)")
-            elif 95 <= autonomia <= 115:
-                liberado = True
-                litros = "30L"
-                st.success("✅ COTA LIBERADA: 30 Litros de Gasolina (Autonomia entre 95 e 115km)")
-            elif 115 < autonomia <= 125:
-                liberado = True
-                litros = "35L"
-                st.success("✅ COTA LIBERADA: 35 Litros de Gasolina (Autonomia entre 115 e 125km)")
+            # Cálculo pela Autonomia se não digitou os litros
+            if prefixo in ["25-1001", "25-1111"]:
+                if 0 < autonomia <= 70:
+                    liberado = True
+                    litros = "60L"
+                    st.success("✅ COTA LIBERADA: 60 Litros de Diesel (Autonomia <= 70km)")
+                elif 70 < autonomia <= 180:
+                    liberado = True
+                    litros = "50L"
+                    st.success("✅ COTA LIBERADA: 50 Litros de Diesel (Autonomia até 180km)")
+                else:
+                    st.error(f"❌ Bloqueado: Autonomia ({autonomia}km) acima do limite permitido (>180km).")
             else:
-                st.error(f"❌ Bloqueado: Autonomia ({autonomia}km) fora das faixas permitidas.")
+                if 0 < autonomia <= 70:
+                    liberado = True
+                    litros = "40L"
+                    st.success("✅ COTA LIBERADA: 40 Litros de Gasolina (Autonomia <= 70km)")
+                elif 95 <= autonomia <= 115:
+                    liberado = True
+                    litros = "30L"
+                    st.success("✅ COTA LIBERADA: 30 Litros de Gasolina (Autonomia entre 95 e 115km)")
+                elif 115 < autonomia <= 125:
+                    liberado = True
+                    litros = "35L"
+                    st.success("✅ COTA LIBERADA: 35 Litros de Gasolina (Autonomia entre 115 e 125km)")
+                else:
+                    st.error(f"❌ Bloqueado: Autonomia ({autonomia}km) fora das faixas permitidas.")
 
     elif tipo_operacao == "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)":
         liberado = True
@@ -562,7 +603,7 @@ elif menu == "📸 Check-in & Abastecimento":
         if not motorista:
             st.warning("Informe o nome do motorista.")
         elif tipo_operacao == "⛽ Realizar Abastecimento" and not liberado:
-            st.error("Não é possível salvar abastecimento fora da cota autorizada.")
+            st.error("Informe a quantidade de litros ou uma autonomia dentro da cota autorizada.")
         else:
             caminho_foto = salvar_foto(foto_capturada, prefixo, status_reg[:5])
             c = conn.cursor()
@@ -572,17 +613,17 @@ elif menu == "📸 Check-in & Abastecimento":
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (data.strftime("%Y-%m-%d"), prefixo, motorista, km_atual, litros, hora.strftime("%H:%M"), status_reg, caminho_foto, obs))
             conn.commit()
-            st.success(f"✅ Registro de **{status_reg}** gravado com sucesso!")
+            st.success(f"✅ Registro de **{status_reg}** ({litros}) gravado com sucesso às {hora.strftime('%H:%M')} (Horário de Manaus)!")
 
 # 4. CORRIGIR / EDITAR LANÇAMENTO
 elif menu == "✏️ Corrigir / Editar Lançamento":
     st.subheader("✏️ Correção e Edição de Lançamentos Anteriores")
-    st.info("Selecione o registro para ajustar o KM, prefixo ou o tipo de evento (Abastecimento vs. Assunção):")
+    st.info("Ajuste horários, quilometragens ou quantidades de litros de lançamentos passados:")
     
     df_todos = pd.read_sql_query("SELECT id, data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao FROM abastecimentos ORDER BY id DESC", conn)
     
     if not df_todos.empty:
-        opcoes_regs = [f"ID {r['id']} | [{r['status_registro']}] {r['data']} | VTR: {r['prefixo']} | KM: {r['km_atual']} | Mot: {r['motorista']}" for _, r in df_todos.iterrows()]
+        opcoes_regs = [f"ID {r['id']} | [{r['status_registro']}] {r['data']} {r['horario']} | VTR: {r['prefixo']} | KM: {r['km_atual']} | Litros: {r['litros_liberados']} | Mot: {r['motorista']}" for _, r in df_todos.iterrows()]
         escolha = st.selectbox("Selecione o registro para editar:", opcoes_regs)
         
         reg_id = int(escolha.split(" | ")[0].replace("ID ", ""))
@@ -594,15 +635,22 @@ elif menu == "✏️ Corrigir / Editar Lançamento":
             with col_e1:
                 vtr_edit = st.selectbox("Prefixo da Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"], index=["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"].index(item['prefixo']) if item['prefixo'] in ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"] else 0)
                 mot_edit = st.text_input("Motorista", value=str(item['motorista']))
-                km_edit = st.number_input("KM Odômetro Correto", value=float(item['km_atual']), step=1.0)
+                km_edit = st.number_input("KM Odômetro", value=float(item['km_atual']), step=1.0)
                 status_edit = st.selectbox("Classificação do Registro", ["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"], index=["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"].index(item['status_registro']) if item['status_registro'] in ["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"] else 0)
             with col_e2:
                 try:
                     data_val = datetime.datetime.strptime(item['data'], "%Y-%m-%d").date()
                 except:
-                    data_val = datetime.date.today()
+                    data_val = get_agora_manaus().date()
                 data_edit = st.date_input("Data", value=data_val)
-                litros_edit = st.text_input("Quantidade de Litros (ou N/A)", value=str(item['litros_liberados']))
+                
+                try:
+                    hora_val = datetime.datetime.strptime(item['horario'], "%H:%M").time()
+                except:
+                    hora_val = get_agora_manaus().time()
+                hora_edit = st.time_input("Horário Correto", value=hora_val)
+                
+                litros_edit = st.text_input("Quantidade de Litros (Ex: 50L ou N/A)", value=str(item['litros_liberados']))
                 obs_edit = st.text_input("Observação / Motivo da Correção", value=str(item['observacao']) if item['observacao'] else "")
                 
             c_btn1, c_btn2 = st.columns(2)
@@ -615,11 +663,11 @@ elif menu == "✏️ Corrigir / Editar Lançamento":
                 c = conn.cursor()
                 c.execute("""
                     UPDATE abastecimentos 
-                    SET data = ?, prefixo = ?, motorista = ?, km_atual = ?, litros_liberados = ?, status_registro = ?, observacao = ?
+                    SET data = ?, horario = ?, prefixo = ?, motorista = ?, km_atual = ?, litros_liberados = ?, status_registro = ?, observacao = ?
                     WHERE id = ?
-                """, (data_edit.strftime("%Y-%m-%d"), vtr_edit, mot_edit, km_edit, litros_edit, status_edit, obs_edit, reg_id))
+                """, (data_edit.strftime("%Y-%m-%d"), hora_edit.strftime("%H:%M"), vtr_edit, mot_edit, km_edit, litros_edit, status_edit, obs_edit, reg_id))
                 conn.commit()
-                st.success("✅ Registro atualizado com sucesso! Os relatórios foram recalculados.")
+                st.success("✅ Registro atualizado com sucesso!")
                 st.rerun()
                 
             if excluir:
@@ -680,7 +728,7 @@ elif menu == "📋 Livro de Ocorrências / Avarias":
                 tipo_oc = st.selectbox("Tipo de Ocorrência", ["Arranhão/Avaria Leve", "Sinistro/Colisão", "Problema Mecânico/Elétrico", "Cautela/Empréstimo", "Outro"], key="tipo_m")
                 motorista_oc = st.text_input("Policial / Motorista Envolvido", key="mot_m")
             with col2:
-                data_oc = st.date_input("Data do Ocorrido", datetime.date.today(), key="data_m")
+                data_oc = st.date_input("Data do Ocorrido", get_agora_manaus().date(), key="data_m")
                 descricao = st.text_area("Descrição Detalhada (Cole aqui o texto ditado ou digite)", placeholder="Descreva o arranhão, sinistro ou alteração...", key="desc_m")
                 
             if st.form_submit_button("Salvar Registro"):
@@ -708,7 +756,7 @@ elif menu == "📋 Livro de Ocorrências / Avarias":
                 tipo_w = st.selectbox("Tipo", ["Avaria/Livro de Alterações", "Sinistro", "Manutenção", "Outro"], key="tipo_w")
             with col_w2:
                 mot_w = st.text_input("Policial / Responsável", key="mot_w")
-                data_w = st.date_input("Data", datetime.date.today(), key="data_w")
+                data_w = st.date_input("Data", get_agora_manaus().date(), key="data_w")
                 
             if st.button("Gravar Histórico do Word no Sistema"):
                 c = conn.cursor()
@@ -721,7 +769,7 @@ elif menu == "📋 Livro de Ocorrências / Avarias":
     df_oc = pd.read_sql_query("SELECT data_hora as Data, prefixo as Viatura, tipo as Tipo, motorista as Envolvido, descricao as Detalhes FROM ocorrencias ORDER BY id DESC", conn)
     st.dataframe(df_oc, use_container_width=True)
 
-# 7. CONSULTA, FOTOS & EXPORTAÇÃO SEPARADA
+# 7. CONSULTA, FOTOS & EXPORTAÇÃO
 elif menu == "🔎 Consulta, Fotos & Exportação":
     st.subheader("🔎 Consulta Separada por Categoria e Exportação")
     
@@ -731,11 +779,10 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
                horario as Horário, status_registro as [Tipo Evento], 
                observacao as [Motivo/Obs], foto_painel
         FROM abastecimentos 
-        ORDER BY data DESC, id DESC
+        ORDER BY data DESC, horario DESC, id DESC
     """, conn)
     
     if not df_abast.empty:
-        # Filtros no topo
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
             filtro_vtr = st.selectbox("Filtrar Viatura", ["Todas"] + list(df_abast['Viatura'].unique()))
@@ -752,7 +799,6 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
         if filtro_data is not None:
             df_filtrado = df_filtrado[df_filtrado['Data'] == filtro_data.strftime("%Y-%m-%d")]
 
-        # Divisão em Abas Separadas para NÃO MISTURAR
         tab_abast, tab_assuncao, tab_nao, tab_todos = st.tabs([
             "⛽ Abastecimentos Reais", 
             "🕒 Assunção de Serviço (KM Inicial)", 
@@ -767,7 +813,6 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
             st.write(f"**Total de Abastecimentos Registrados:** {len(df_aba_abast)}")
             st.dataframe(df_aba_abast[colunas_exibir], use_container_width=True)
             
-            # Galeria de fotos de abastecimento
             fotos_abast = df_aba_abast[df_aba_abast['foto_painel'].notna() & (df_aba_abast['foto_painel'] != '')]
             if not fotos_abast.empty:
                 st.write("##### 📸 Comprovações Fotográficas dos Abastecimentos")
@@ -775,14 +820,13 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
                 for idx, (_, r_f) in enumerate(fotos_abast.iterrows()):
                     if os.path.exists(str(r_f['foto_painel'])):
                         with cols[idx % 3]:
-                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} ({r_f['KM Odômetro']} km | {r_f['Qtd Liberada']})", use_container_width=True)
+                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} às {r_f['Horário']} ({r_f['KM Odômetro']} km | {r_f['Qtd Liberada']})", use_container_width=True)
 
         with tab_assuncao:
             df_aba_assuncao = df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço']
             st.write(f"**Total de Entradas de Plantão (KM Inicial):** {len(df_aba_assuncao)}")
             st.dataframe(df_aba_assuncao[colunas_exibir], use_container_width=True)
             
-            # Galeria de fotos de assunção
             fotos_assuncao = df_aba_assuncao[df_aba_assuncao['foto_painel'].notna() & (df_aba_assuncao['foto_painel'] != '')]
             if not fotos_assuncao.empty:
                 st.write("##### 📸 Fotos de Painel na Entrada do Turno")
@@ -790,7 +834,7 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
                 for idx, (_, r_f) in enumerate(fotos_assuncao.iterrows()):
                     if os.path.exists(str(r_f['foto_painel'])):
                         with cols[idx % 3]:
-                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} (KM Inicial: {r_f['KM Odômetro']})", use_container_width=True)
+                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} às {r_f['Horário']} (KM: {r_f['KM Odômetro']})", use_container_width=True)
 
         with tab_nao:
             df_aba_nao = df_filtrado[df_filtrado['Tipo Evento'] == 'Não Abasteceu (N/A)']
@@ -802,13 +846,12 @@ elif menu == "🔎 Consulta, Fotos & Exportação":
             st.dataframe(df_filtrado[colunas_exibir], use_container_width=True)
         
         st.write("---")
-        # Exportação com 2 abas no Excel
         excel_bytes = converter_dfs_para_excel_multiplas_abas(
             df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido'][colunas_exibir],
             df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço'][colunas_exibir]
         )
         st.download_button(
-            label="📥 Baixar Planilha Excel Organizada (Abas Separadas: Abastecimento e Assunção)",
+            label="📥 Baixar Planilha Excel Organizada (Abas Separadas)",
             data=excel_bytes,
             file_name="Relatorio_Frota_10CICOM_Abas_Separadas.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
