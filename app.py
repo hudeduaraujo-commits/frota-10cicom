@@ -1,952 +1,683 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import sqlite3
-import datetime
-import zoneinfo
-import docx
 import os
-import io
+import glob
 import re
-from PIL import Image
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import io
 
-# Configuração de Motor OCR
-try:
-    import easyocr
-    OCR_ENGINE = "easyocr"
-except ImportError:
-    try:
-        import pytesseract
-        OCR_ENGINE = "pytesseract"
-    except ImportError:
-        OCR_ENGINE = "manual"
+# -----------------------------------------------------------------------------
+# CONFIGURAÇÃO GERAL E FUSO OFICIAL DE MANAUS (UTC-4)
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Gestão de Frota - 10ª CICOM",
+    page_icon="🚔",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Configuração de Fuso Horário Oficial de Manaus (UTC-4)
-TZ_MANAUS = zoneinfo.ZoneInfo("America/Manaus")
+FUSO_MANAUS = ZoneInfo("America/Manaus")
 
-def get_agora_manaus():
-    return datetime.datetime.now(TZ_MANAUS)
+def agora_manaus():
+    return datetime.now(FUSO_MANAUS)
 
-# Configuração da Página
-st.set_page_config(page_title="Gestão de Frota - 10ª CICOM", layout="wide", page_icon="🚔")
+NOME_BANCO = "frota_10cicom.db"
+ARQUIVO_EXCEL = "kms_abastecimento_10cicom.xlsx"
 
-DB_FILE = "frota_10cicom.db"
-FOTOS_DIR = "fotos_paineis"
-os.makedirs(FOTOS_DIR, exist_ok=True)
+# -----------------------------------------------------------------------------
+# BANCO DE DADOS SQLITE & SCHEMA DEFENSIVO
+# -----------------------------------------------------------------------------
+def get_conexao():
+    return sqlite3.connect(NOME_BANCO, check_same_thread=False)
 
-# --- CONTROLE DE ACESSO ---
-SENHA_PADRAO = "10cicom"
+def inicializar_banco():
+    conn = get_conexao()
+    cursor = conn.cursor()
+    
+    # Tabela de Viaturas
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS viaturas (
+            prefixo TEXT PRIMARY KEY,
+            modelo TEXT,
+            placa TEXT,
+            combustivel TEXT,
+            km_revisao_base INTEGER,
+            intervalo_revisao INTEGER DEFAULT 10000,
+            status TEXT DEFAULT 'Operacional'
+        )
+    """)
+    
+    # Tabela de Abastecimentos e Quilometragem
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS abastecimentos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefixo TEXT,
+            data TEXT,
+            horario TEXT,
+            km_atual INTEGER,
+            litros REAL DEFAULT 0.0,
+            motorista TEXT,
+            placa TEXT,
+            observacao TEXT,
+            origem TEXT DEFAULT 'PLANILHA',
+            FOREIGN KEY (prefixo) REFERENCES viaturas(prefixo)
+        )
+    """)
 
-def check_login():
-    if "autenticado" not in st.session_state:
-        st.session_state.autenticado = False
+    # Tabela de Avarias e Ocorrências
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ocorrencias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prefixo TEXT,
+            data TEXT,
+            tipo TEXT,
+            descricao TEXT,
+            status TEXT DEFAULT 'Pendente',
+            registrado_por TEXT,
+            FOREIGN KEY (prefixo) REFERENCES viaturas(prefixo)
+        )
+    """)
+    
+    # Auto-migração para garantir compatibilidade de colunas
+    cursor.execute("PRAGMA table_info(abastecimentos)")
+    colunas_existentes = [c[1] for c in cursor.fetchall()]
+    for col_nome, col_tipo in [
+        ("horario", "TEXT"),
+        ("km_atual", "INTEGER DEFAULT 0"),
+        ("litros", "REAL DEFAULT 0.0"),
+        ("motorista", "TEXT"),
+        ("placa", "TEXT"),
+        ("observacao", "TEXT"),
+        ("origem", "TEXT DEFAULT 'PLANILHA'")
+    ]:
+        if col_nome not in colunas_existentes:
+            cursor.execute(f"ALTER TABLE abastecimentos ADD COLUMN {col_nome} {col_tipo}")
 
-    if not st.session_state.autenticado:
-        st.markdown("<h2 style='text-align: center;'>🚔 Gestão de Frota - 10ª CICOM</h2>", unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center;'>Acesso restrito ao efetivo autorizado</p>", unsafe_allow_html=True)
+    # Carga de Viaturas Ativas da 10ª CICOM
+    cursor.execute("SELECT COUNT(*) FROM viaturas")
+    if cursor.fetchone()[0] == 0:
+        viaturas_iniciais = [
+            ("25-1001", "Chevrolet S10", "TRX-6I85", "Diesel", 40000, 10000, "Operacional"),
+            ("25-1111", "Chevrolet S10", "TRX-4B85", "Diesel", 40000, 10000, "Operacional"),
+            ("25-1329", "Chevrolet Spin", "TRZ-7E17", "Gasolina", 50000, 10000, "Operacional"),
+            ("25-1353", "Chevrolet Spin", "TSC-2D46", "Gasolina", 30000, 10000, "Operacional"),
+            ("25-1394", "Chevrolet Spin", "UTS-3J57", "Gasolina", 20000, 10000, "Operacional")
+        ]
+        cursor.executemany("""
+            INSERT OR IGNORE INTO viaturas (prefixo, modelo, placa, combustivel, km_revisao_base, intervalo_revisao, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, viaturas_iniciais)
         
-        col1, col2, col3 = st.columns([1, 1.2, 1])
-        with col2:
-            with st.form("form_login"):
-                senha = st.text_input("Digite a Senha de Acesso", type="password")
-                entrar = st.form_submit_button("Entrar no Sistema", use_container_width=True)
-                if entrar:
-                    if senha == SENHA_PADRAO:
-                        st.session_state.autenticado = True
-                        st.rerun()
-                    else:
-                        st.error("Senha incorreta. Tente novamente.")
-        return False
-    return True
-
-# --- OCR E EXTRAÇÃO ---
-@st.cache_resource
-def carregar_leitor_ocr():
-    if OCR_ENGINE == "easyocr":
-        return easyocr.Reader(['pt', 'en'], gpu=False)
-    return None
-
-def extrair_texto_imagem(imagem_bytes):
-    texto_completo = ""
-    if OCR_ENGINE == "easyocr":
-        reader = carregar_leitor_ocr()
-        resultados = reader.readtext(imagem_bytes.getvalue(), detail=0)
-        texto_completo = " ".join(resultados)
-    elif OCR_ENGINE == "pytesseract":
-        img = Image.open(imagem_bytes)
-        texto_completo = pytesseract.image_to_string(img, lang='por')
-    return texto_completo
-
-def interpretar_dados_mensagem(texto):
-    dados = {
-        "prefixo": "25-1001",
-        "motorista": "",
-        "km_atual": 0.0,
-        "autonomia": 0.0,
-        "litros_digitados": 0.0,
-        "tipo_operacao": "⛽ Realizar Abastecimento",
-        "status_registro": "Abastecido"
-    }
-    
-    if not texto:
-        return dados
-        
-    texto_clean = texto.upper()
-    
-    # 1. Prefixo
-    if "1001" in texto_clean or "25-1001" in texto_clean:
-        dados["prefixo"] = "25-1001"
-    elif "1111" in texto_clean or "25-1111" in texto_clean:
-        dados["prefixo"] = "25-1111"
-    elif "1329" in texto_clean or "25-1329" in texto_clean:
-        dados["prefixo"] = "25-1329"
-    elif "1353" in texto_clean or "25-1353" in texto_clean:
-        dados["prefixo"] = "25-1353"
-    elif "1394" in texto_clean or "25-1394" in texto_clean:
-        dados["prefixo"] = "25-1394"
-
-    # 2. KM / Odômetro
-    match_km = re.search(r'(?:KM|ODO|ODÔMETRO|INICIAL)[\s:\.\-]*([0-9]{2,6}(?:[\.,][0-9]{1,3})?)', texto_clean)
-    if match_km:
-        num_str = match_km.group(1).replace('.', '').replace(',', '.')
-        try:
-            dados["km_atual"] = float(num_str)
-        except ValueError:
-            pass
-    else:
-        match_numeros = re.findall(r'\b[0-9]{4,6}\b', texto_clean)
-        if match_numeros:
-            for num in match_numeros:
-                if num not in ["1001", "1111", "1329", "1353", "1394"]:
-                    dados["km_atual"] = float(num)
-                    break
-
-    # 3. Motorista
-    match_mot = re.search(r'(?:MOTORISTA|CONDUTOR|FAROL|SD|CB|SGT|SUB|TEN|CAP)[\s:\.\-]*([A-Z\s]+?)(?=\n|KM|VTR|AUTO|LITRO|$)', texto_clean)
-    if match_mot:
-        dados["motorista"] = match_mot.group(0).strip().title()
-
-    # 4. Litros
-    match_litros = re.search(r'(?:LITRO|LITROS|LT|LTS|QTD|QUANTIDADE)[\s:\.\-]*([0-9]{1,3}(?:[\.,][0-9]{1,2})?)', texto_clean)
-    if match_litros:
-        try:
-            dados["litros_digitados"] = float(match_litros.group(1).replace(',', '.'))
-        except ValueError:
-            pass
-
-    # 5. Autonomia
-    match_auto = re.search(r'(?:AUTONOMIA|AUTO)[\s:\.\-]*([0-9]{1,4})', texto_clean)
-    if match_auto:
-        try:
-            dados["autonomia"] = float(match_auto.group(1))
-        except ValueError:
-            pass
-            
-    # 6. Tipo de Operação
-    if "ASSUNÇÃO" in texto_clean or "ENTRADA" in texto_clean or "INÍCIO" in texto_clean or "INICIO" in texto_clean:
-        dados["tipo_operacao"] = "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)"
-        dados["status_registro"] = "Assunção de Serviço"
-    elif "NÃO ABASTECEU" in texto_clean or "N/A" in texto_clean:
-        dados["tipo_operacao"] = "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"
-        dados["status_registro"] = "Não Abasteceu (N/A)"
-
-    return dados
-
-# --- COMPONENTE DE DITADO POR VOZ ---
-def componente_ditado_voz(chave_id="transcricao_box"):
-    html_code = f"""
-    <div style="background-color: #f0f2f6; border-radius: 8px; padding: 12px; margin-bottom: 10px; font-family: sans-serif;">
-        <button id="btn_rec_{chave_id}" type="button" style="background-color: #ff4b4b; color: white; border: none; padding: 8px 16px; border-radius: 5px; font-weight: bold; cursor: pointer;">
-            🎙️ Iniciar Ditado por Voz
-        </button>
-        <span id="status_{chave_id}" style="margin-left: 10px; font-size: 13px; color: #555;">Clique para falar...</span>
-        <div style="margin-top: 8px;">
-            <textarea id="{chave_id}" rows="3" style="width: 100%; border: 1px solid #ccc; border-radius: 5px; padding: 6px; font-size: 14px;" placeholder="O texto falado aparecerá aqui..."></textarea>
-        </div>
-        <button id="btn_copiar_{chave_id}" type="button" style="margin-top: 5px; background-color: #0e1117; color: white; border: none; padding: 5px 10px; border-radius: 4px; font-size: 12px; cursor: pointer;">
-            📋 Copiar Texto Ditado
-        </button>
-    </div>
-
-    <script>
-        const btnRec = document.getElementById('btn_rec_{chave_id}');
-        const statusTxt = document.getElementById('status_{chave_id}');
-        const txtArea = document.getElementById('{chave_id}');
-        const btnCopiar = document.getElementById('btn_copiar_{chave_id}');
-
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition) {{
-            const recognition = new SpeechRecognition();
-            recognition.lang = 'pt-BR';
-            recognition.continuous = false;
-            recognition.interimResults = false;
-
-            btnRec.onclick = () => {{
-                try {{
-                    recognition.start();
-                    statusTxt.innerText = '🔴 Ouvindo... Pode falar.';
-                    btnRec.style.backgroundColor = '#d32f2f';
-                }} catch (e) {{
-                    recognition.stop();
-                }}
-            }};
-
-            recognition.onresult = (event) => {{
-                const transcript = event.results[0][0].transcript;
-                if (txtArea.value) {{
-                    txtArea.value += ' ' + transcript;
-                }} else {{
-                    txtArea.value = transcript;
-                }}
-                statusTxt.innerText = '✅ Fala convertida em texto!';
-                btnRec.style.backgroundColor = '#ff4b4b';
-            }};
-
-            recognition.onerror = (event) => {{
-                statusTxt.innerText = '⚠️ Erro ao capturar áudio (' + event.error + ')';
-                btnRec.style.backgroundColor = '#ff4b4b';
-            }};
-
-            recognition.onend = () => {{
-                btnRec.style.backgroundColor = '#ff4b4b';
-            }};
-        }} else {{
-            btnRec.disabled = true;
-            statusTxt.innerText = 'Navegador sem suporte a Web Speech API. Utilize o teclado.';
-        }}
-
-        btnCopiar.onclick = () => {{
-            txtArea.select();
-            document.execCommand('copy');
-            statusTxt.innerText = '📋 Texto copiado para a área de transferência!';
-        }};
-    </script>
-    """
-    components.html(html_code, height=160)
-
-# --- BANCO DE DADOS ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS viaturas (
-        prefixo TEXT PRIMARY KEY,
-        modelo TEXT,
-        combustivel TEXT,
-        placa TEXT,
-        status TEXT,
-        km_ultima_revisao REAL,
-        km_proxima_revisao REAL
-    )
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS abastecimentos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        data TEXT,
-        prefixo TEXT,
-        motorista TEXT,
-        km_atual REAL,
-        litros_liberados TEXT,
-        horario TEXT,
-        status_registro TEXT DEFAULT 'Abastecido',
-        foto_painel TEXT,
-        observacao TEXT,
-        UNIQUE(data, prefixo, km_atual, horario)
-    )
-    """)
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS ocorrencias (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        data_hora TEXT,
-        prefixo TEXT,
-        tipo TEXT,
-        descricao TEXT,
-        motorista TEXT
-    )
-    """)
-    
-    frota = [
-        ("25-1001", "S10", "Diesel", "TRX-6I85", "Ativa", 30000, 40000),
-        ("25-1111", "S10", "Diesel", "TRX-4B85", "Ativa", 50000, 60000),
-        ("25-1329", "Spin", "Gasolina", "TRZ-7E17", "Ativa", 0, 10000),
-        ("25-1353", "Spin", "Gasolina", "TSC-2D46", "Emprestada", 0, 10000),
-        ("25-1394", "Spin", "Gasolina", "UTS-3J57", "Ativa", 0, 10000)
-    ]
-    c.executemany("INSERT OR IGNORE INTO viaturas VALUES (?, ?, ?, ?, ?, ?, ?)", frota)
-    
     conn.commit()
     conn.close()
 
-def salvar_foto(foto_file, prefixo, tipo_evento):
-    if foto_file is not None:
-        timestamp = get_agora_manaus().strftime("%Y%m%d_%H%M%S")
-        nome_arquivo = f"{prefixo}_{tipo_evento}_{timestamp}.jpg"
-        caminho = os.path.join(FOTOS_DIR, nome_arquivo)
-        with open(caminho, "wb") as f:
-            f.write(foto_file.getbuffer())
-        return caminho
+inicializar_banco()
+
+# -----------------------------------------------------------------------------
+# PARSER ROBUSTO PARA MATRIZ DE AGOSTO E SETEMBRO (143 COLUNAS)
+# -----------------------------------------------------------------------------
+def normalizar_qualquer_data(val, default_year="2026"):
+    """Converte qualquer formato de data (Excel serial, texto, DD/MM, ISO) para YYYY-MM-DD."""
+    if pd.isna(val) or val is None:
+        return None
+    if isinstance(val, (datetime, pd.Timestamp)):
+        return val.strftime("%Y-%m-%d")
+        
+    # Trata data serial numérica do Excel (ex: 46266)
+    try:
+        f_val = float(val)
+        if 40000 < f_val < 60000:
+            dt = pd.to_datetime(f_val, unit='D', origin='1899-12-30')
+            return dt.strftime("%Y-%m-%d")
+    except:
+        pass
+        
+    s = str(val).strip()
+    
+    # Formato ISO: YYYY-MM-DD
+    m_iso = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', s)
+    if m_iso:
+        return f"{m_iso.group(1)}-{m_iso.group(2).zfill(2)}-{m_iso.group(3).zfill(2)}"
+        
+    # Formato BR completo: DD/MM/YYYY
+    m_br = re.search(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})', s)
+    if m_br:
+        return f"{m_br.group(3)}-{m_br.group(2).zfill(2)}-{m_br.group(1).zfill(2)}"
+        
+    # Formato curto: DD/MM (ex: 01/09 ou 12/08)
+    m_curto = re.search(r'^(\d{1,2})[-/](\d{1,2})$', s)
+    if m_curto:
+        dia = m_curto.group(1).zfill(2)
+        mes = m_curto.group(2).zfill(2)
+        return f"{default_year}-{mes}-{dia}"
+        
+    # Formato textual: 10-Aug, 1-Set, 04-Sep
+    meses_map = {
+        "jan": "01", "fev": "02", "feb": "02", "mar": "03", "abr": "04", "apr": "04",
+        "mai": "05", "may": "05", "jun": "06", "jul": "07", "ago": "08", "aug": "08",
+        "set": "09", "sep": "09", "out": "10", "oct": "10", "nov": "11", "dez": "12", "dec": "12"
+    }
+    m_txt = re.search(r'(\d{1,2})[-/ ]([A-Za-z]{3})', s)
+    if m_txt:
+        dia = m_txt.group(1).zfill(2)
+        mes = meses_map.get(m_txt.group(2).lower(), "08")
+        return f"{default_year}-{mes}-{dia}"
+        
     return None
 
-def converter_dfs_para_excel_multiplas_abas(df_abast, df_assuncao):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_abast.to_excel(writer, index=False, sheet_name='Abastecimentos')
-        df_assuncao.to_excel(writer, index=False, sheet_name='Assuncao_Servico')
-    return output.getvalue()
+def resolver_data_da_coluna(df_raw, col_km):
+    """Localiza a data do bloco de KM buscando nas linhas 1 e 2 e colunas vizinhas."""
+    # Tenta na linha 2 (onde estão as datas diárias)
+    for offset in [0, -1, 1, -2, 2, -3, 3, -4]:
+        c = col_km + offset
+        if 0 <= c < len(df_raw.columns):
+            val2 = df_raw.iloc[2, c]
+            d_fmt = normalizar_qualquer_data(val2)
+            if d_fmt:
+                return d_fmt
+            # Tenta na linha 1 caso esteja mesclado acima
+            val1 = df_raw.iloc[1, c]
+            d_fmt1 = normalizar_qualquer_data(val1)
+            if d_fmt1:
+                return d_fmt1
+    return "2026-08-10"
 
-init_db()
-
-if not check_login():
-    st.stop()
-
-# --- BARRA LATERAL ---
-with st.sidebar:
-    st.title("🚔 10ª CICOM")
-    st.write("Gestão Operacional de Frota")
+def extrair_registros_10cicom(df_raw):
+    records = []
     
-    agora_m = get_agora_manaus()
-    st.info(f"🕒 **Manaus (AM):** {agora_m.strftime('%d/%m/%Y %H:%M')}")
+    # 1. Mapeamento das viaturas e placas fixas (colunas 1 e 2 a partir da linha 4)
+    placa_map = {}
+    for r in range(4, len(df_raw)):
+        v_num = str(df_raw.iloc[r, 1]).strip()
+        p_val = str(df_raw.iloc[r, 2]).strip()
+        if v_num.isdigit():
+            placa_map[v_num] = p_val if p_val.upper() not in ['NAN', 'NONE'] else ''
+
+    # 2. Identifica TODAS as colunas que representam KM na linha 3 (cobre agosto e setembro)
+    km_cols = []
+    for c in range(len(df_raw.columns)):
+        val_header = str(df_raw.iloc[3, c]).strip().lower()
+        if val_header == 'km' or val_header.startswith('km'):
+            km_cols.append(c)
+
+    # 3. Varre todos os blocos diários
+    for c_km in km_cols:
+        data_registro = resolver_data_da_coluna(df_raw, c_km)
+
+        c_vtr = c_km - 1
+        c_farol = c_km + 1
+        c_qtde = c_km + 2
+        c_hora = c_km + 3
+
+        for r in range(4, len(df_raw)):
+            vtr_raw = str(df_raw.iloc[r, c_vtr]).strip()
+            if not vtr_raw.isdigit():
+                vtr_raw = str(df_raw.iloc[r, 1]).strip()
+            if not vtr_raw.isdigit():
+                continue
+
+            prefixo = f"25-{vtr_raw}"
+            placa = placa_map.get(vtr_raw, "")
+
+            km_raw = str(df_raw.iloc[r, c_km]).strip()
+            km_clean = km_raw.replace('.', '').replace(',', '').replace(' ', '')
+
+            # Identifica leitura de odômetro válida
+            if km_clean.isdigit() and int(km_clean) > 100:
+                km_val = int(km_clean)
+
+                motorista = "Turno Serviço"
+                if c_farol < len(df_raw.columns):
+                    m_val = str(df_raw.iloc[r, c_farol]).strip()
+                    if m_val.upper() not in ['NAN', 'NONE', 'N/A', 'N/I', '']:
+                        motorista = m_val
+
+                litros = 0.0
+                if c_qtde < len(df_raw.columns):
+                    q_val = str(df_raw.iloc[r, c_qtde]).strip()
+                    l_nums = re.findall(r'\d+', q_val)
+                    if l_nums:
+                        litros = float(l_nums[0])
+
+                horario = "07:00"
+                if c_hora < len(df_raw.columns):
+                    h_val = str(df_raw.iloc[r, c_hora]).strip()
+                    if h_val.upper() not in ['NAN', 'NONE', 'N/A', 'N/I', ''] and ':' in h_val:
+                        horario = h_val[:5]
+
+                records.append({
+                    "prefixo": prefixo,
+                    "placa": placa,
+                    "data": data_registro,
+                    "km_atual": km_val,
+                    "motorista": motorista,
+                    "litros": litros,
+                    "horario": horario
+                })
+
+    return records
+
+def salvar_no_banco(registros, limpar_antes=False):
+    conn = get_conexao()
+    cursor = conn.cursor()
     
-    menu = st.radio("Navegação", [
-        "📊 Painel de Controle (Dashboard)",
-        "🤖 Leitura Automática de Print (OCR)",
-        "📸 Check-in & Abastecimento", 
-        "✏️ Corrigir / Editar Lançamento",
-        "🛠️ Status da Frota & Revisões", 
-        "📋 Livro de Ocorrências / Avarias", 
-        "🔎 Consulta, Fotos & Exportação", 
-        "📥 Importar Planilha Excel"
-    ])
-    st.write("---")
-    if st.button("🚪 Sair do Sistema"):
-        st.session_state.autenticado = False
-        st.rerun()
-
-conn = sqlite3.connect(DB_FILE)
-
-# 1. PAINEL DE CONTROLE (DASHBOARD)
-if menu == "📊 Painel de Controle (Dashboard)":
-    st.subheader("📊 Indicadores Gerais de Consumo e Frota")
-    
-    df_vtr_rev = pd.read_sql_query("SELECT * FROM viaturas", conn)
-    for _, r_v in df_vtr_rev.iterrows():
-        pref = r_v['prefixo']
-        res = conn.execute("SELECT km_atual FROM abastecimentos WHERE prefixo = ? AND km_atual > 0 ORDER BY data DESC, horario DESC, km_atual DESC LIMIT 1", (pref,)).fetchone()
-        km_at = res[0] if res else 0.0
-        km_rest = r_v['km_proxima_revisao'] - km_at
-        if r_v['status'] == 'Ativa' and km_rest <= 500 and km_at > 0:
-            st.error(f"🚨 **ALERTA CRÍTICO:** Viatura **{pref}** ({r_v['modelo']}) está a apenas **{km_rest:.0f} km** da revisão de {r_v['km_proxima_revisao']:.0f} km!")
-        elif r_v['status'] == 'Ativa' and km_rest <= 1500 and km_at > 0:
-            st.warning(f"⚠️ **ATENÇÃO:** Viatura **{pref}** ({r_v['modelo']}) está próxima da revisão ({km_rest:.0f} km restantes).")
-
-    df_abast = pd.read_sql_query("SELECT * FROM abastecimentos ORDER BY data DESC, horario DESC", conn)
-    df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
-    
-    if not df_abast.empty:
-        df_so_abast = df_abast[df_abast['status_registro'] == 'Abastecido'].copy()
-        df_so_abast['litros_num'] = df_so_abast['litros_liberados'].str.replace('L', '', case=False).astype(float, errors='ignore')
-        df_so_abast['litros_num'] = pd.to_numeric(df_so_abast['litros_num'], errors='coerce').fillna(0)
-        
-        total_litros = df_so_abast['litros_num'].sum()
-        total_abast = len(df_so_abast[df_so_abast['litros_num'] > 0])
-        total_assuncoes = len(df_abast[df_abast['status_registro'] == 'Assunção de Serviço'])
-        vtrs_ativas = len(df_vtr[df_vtr['status'] == 'Ativa'])
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Abastecimentos Realizados", f"{total_abast}")
-        c2.metric("Assunções de Serviço (KM Inicial)", f"{total_assuncoes}")
-        c3.metric("Total Combustível", f"{total_litros:.1f} L")
-        c4.metric("Viaturas Ativas", f"{vtrs_ativas}")
-        
-        st.write("---")
-        cg1, cg2 = st.columns(2)
-        with cg1:
-            st.write("##### ⛽ Consumo de Combustível por Viatura (Litros)")
-            consumo_vtr = df_so_abast.groupby('prefixo')['litros_num'].sum()
-            st.bar_chart(consumo_vtr)
-        with cg2:
-            st.write("##### 📈 Distribuição dos Registros")
-            status_cont = df_abast['status_registro'].value_counts()
-            st.bar_chart(status_cont)
-    else:
-        st.info("Nenhum registro cadastrado no momento.")
-
-# 2. LEITURA AUTOMÁTICA DE PRINT / WHATSAPP (OCR)
-elif menu == "🤖 Leitura Automática de Print (OCR)":
-    st.subheader("🤖 Leitura Automática de Print do WhatsApp ou Foto do Painel")
-    st.write("Envie o print ou cole o texto. O sistema ajusta a data e horário no fuso de Manaus.")
-    
-    col_up1, col_up2 = st.columns(2)
-    with col_up1:
-        print_upload = st.file_uploader("Selecione o Print / Foto do WhatsApp", type=["jpg", "jpeg", "png"])
-    with col_up2:
-        texto_colado = st.text_area("Ou Cole o Texto do WhatsApp aqui (Opcional):", placeholder="Ex: VTR 25-1001, Cb Silva, KM: 45200, Abastecido: 50L")
-        
-    dados_extraidos = {
-        "prefixo": "25-1001",
-        "motorista": "",
-        "km_atual": 0.0,
-        "autonomia": 0.0,
-        "litros_digitados": 0.0,
-        "tipo_operacao": "⛽ Realizar Abastecimento",
-        "status_registro": "Abastecido"
-    }
-
-    if print_upload is not None:
-        st.image(print_upload, caption="Print / Imagem Carregada", width=300)
-        with st.spinner("🤖 Analisando imagem e extraindo texto com OCR..."):
-            texto_ocr = extrair_texto_imagem(print_upload)
-            texto_combinado = f"{texto_ocr} {texto_colado}"
-            dados_extraidos = interpretar_dados_mensagem(texto_combinado)
-            if texto_ocr:
-                st.success("✅ Texto lido com sucesso pela imagem!")
-                with st.expander("Ver texto detectado pelo OCR"):
-                    st.write(texto_ocr)
-    elif texto_colado:
-        dados_extraidos = interpretar_dados_mensagem(texto_colado)
-
-    st.write("---")
-    st.write("#### 📝 Conferência dos Dados Extraídos (Horário Oficial de Manaus)")
-    
-    agora_manaus = get_agora_manaus()
-
-    with st.form("form_ocr_confirmar"):
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            lista_vtrs = ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"]
-            idx_vtr = lista_vtrs.index(dados_extraidos["prefixo"]) if dados_extraidos["prefixo"] in lista_vtrs else 0
-            prefixo_conf = st.selectbox("Prefixo da Viatura", lista_vtrs, index=idx_vtr)
-            motorista_conf = st.text_input("Motorista", value=dados_extraidos["motorista"])
-            km_conf = st.number_input("KM Odômetro", value=dados_extraidos["km_atual"], step=1.0)
-            tipo_conf = st.selectbox("Tipo de Registro", [
-                "⛽ Realizar Abastecimento", 
-                "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)",
-                "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"
-            ], index=["⛽ Realizar Abastecimento", "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)", "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"].index(dados_extraidos["tipo_operacao"]))
-            
-        with col_c2:
-            data_conf = st.date_input("Data do Registro", agora_manaus.date())
-            hora_conf = st.time_input("Horário do Registro (Manaus)", agora_manaus.time())
-            
-            litros_manual_ocr = st.number_input(
-                "⛽ Litros Abastecidos na Bomba (Digite a quantidade exata)", 
-                min_value=0.0, 
-                max_value=120.0, 
-                value=float(dados_extraidos["litros_digitados"]), 
-                step=0.5
-            )
-            autonomia_conf = st.number_input("Autonomia informada no painel (km)", value=dados_extraidos["autonomia"], step=1.0)
-
-        litros = "0L"
-        status_reg_salvar = "Abastecido"
-        obs = "Lançamento via Leitura Automática (OCR)"
-        
-        if tipo_conf == "⛽ Realizar Abastecimento":
-            status_reg_salvar = "Abastecido"
-            if litros_manual_ocr > 0:
-                litros = f"{litros_manual_ocr:.1f}L".replace(".0L", "L")
-            else:
-                if prefixo_conf in ["25-1001", "25-1111"]:
-                    if 0 < autonomia_conf <= 70:
-                        litros = "60L"
-                    elif 70 < autonomia_conf <= 180:
-                        litros = "50L"
-                    else:
-                        litros = "0L"
-                else:
-                    if 0 < autonomia_conf <= 70:
-                        litros = "40L"
-                    elif 95 <= autonomia_conf <= 115:
-                        litros = "30L"
-                    elif 115 < autonomia_conf <= 125:
-                        litros = "35L"
-                    else:
-                        litros = "0L"
-        elif tipo_conf == "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)":
-            status_reg_salvar = "Assunção de Serviço"
-            litros = "0L"
-            obs = "KM Inicial de Entrada de Turno"
-        elif tipo_conf == "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)":
-            status_reg_salvar = "Não Abasteceu (N/A)"
-            litros = "N/A"
-            obs = "Não Abasteceu (N/A)"
-
-        gravar_ocr = st.form_submit_button("💾 Confirmar e Gravar no Sistema", use_container_width=True)
-        if gravar_ocr:
-            if not motorista_conf:
-                st.warning("Preencha o nome do motorista.")
-            else:
-                caminho_foto = salvar_foto(print_upload, prefixo_conf, status_reg_salvar[:5])
-                c = conn.cursor()
-                c.execute("""
-                    INSERT OR IGNORE INTO abastecimentos 
-                    (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, foto_painel, observacao) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (data_conf.strftime("%Y-%m-%d"), prefixo_conf, motorista_conf, km_conf, litros, hora_conf.strftime("%H:%M"), status_reg_salvar, caminho_foto, obs))
-                conn.commit()
-                st.success(f"✅ Registro de **{status_reg_salvar}** ({litros}) gravado com o horário oficial de Manaus ({hora_conf.strftime('%H:%M')})!")
-                st.rerun()
-
-# 3. CHECK-IN & ABASTECIMENTO MANUAL
-elif menu == "📸 Check-in & Abastecimento":
-    st.subheader("📸 Registro Diário do Motorista")
-    
-    tipo_operacao = st.radio("Selecione o Tipo de Registro:", [
-        "⛽ Realizar Abastecimento", 
-        "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)",
-        "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)"
-    ], horizontal=True)
-    
-    st.write("---")
-    agora_manaus = get_agora_manaus()
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        prefixo = st.selectbox("Prefixo da Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"])
-        motorista = st.text_input("Nome de Guerra do Motorista (Farol)")
-        km_atual = st.number_input("Quilometragem (KM Odômetro no Painel)", min_value=0.0, step=1.0)
-    with col2:
-        data = st.date_input("Data do Registro", agora_manaus.date())
-        hora = st.time_input("Horário do Registro (Manaus)", agora_manaus.time())
-        
-        if tipo_operacao == "⛽ Realizar Abastecimento":
-            litros_digitados = st.number_input(
-                "⛽ Litros Abastecidos na Bomba (Digite a quantidade exata)", 
-                min_value=0.0, 
-                max_value=120.0, 
-                value=0.0, 
-                step=0.5,
-                help="Digite os litros abastecidos. Caso deixe 0, o sistema calculará automaticamente pela autonomia."
-            )
-            autonomia = st.number_input("Autonomia Restante no painel (km)", min_value=0.0, step=1.0)
-        else:
-            litros_digitados = 0.0
-            autonomia = 0.0
-
-    st.write("##### 📷 Foto do Painel da Viatura (Odômetro)")
-    op_foto = st.radio("Como deseja enviar a foto?", ["📸 Câmera do Celular / Web", "📁 Galeria de Fotos / Arquivo"], horizontal=True)
-    foto_capturada = None
-    if op_foto == "📸 Câmera do Celular / Web":
-        foto_capturada = st.camera_input("Tire a foto do painel mostrando o KM")
-    else:
-        foto_capturada = st.file_uploader("Selecione a foto do painel", type=["jpg", "jpeg", "png"])
-
-    liberado = False
-    litros = "0L"
-    status_reg = "Abastecido"
-    obs = ""
-
-    if tipo_operacao == "⛽ Realizar Abastecimento":
-        status_reg = "Abastecido"
-        if prefixo == "25-1353":
-            obs = "Viatura 25-1353 cedida/emprestada."
-            st.error("⚠️ Viatura 25-1353 está cedida. Abastecimento bloqueado.")
-        elif litros_digitados > 0:
-            liberado = True
-            litros = f"{litros_digitados:.1f}L".replace(".0L", "L")
-            st.success(f"✅ Quantidade Informada: **{litros}** para a viatura {prefixo}.")
-        else:
-            if prefixo in ["25-1001", "25-1111"]:
-                if 0 < autonomia <= 70:
-                    liberado = True
-                    litros = "60L"
-                    st.success("✅ COTA LIBERADA: 60 Litros de Diesel (Autonomia <= 70km)")
-                elif 70 < autonomia <= 180:
-                    liberado = True
-                    litros = "50L"
-                    st.success("✅ COTA LIBERADA: 50 Litros de Diesel (Autonomia até 180km)")
-                else:
-                    st.error(f"❌ Bloqueado: Autonomia ({autonomia}km) acima do limite permitido (>180km).")
-            else:
-                if 0 < autonomia <= 70:
-                    liberado = True
-                    litros = "40L"
-                    st.success("✅ COTA LIBERADA: 40 Litros de Gasolina (Autonomia <= 70km)")
-                elif 95 <= autonomia <= 115:
-                    liberado = True
-                    litros = "30L"
-                    st.success("✅ COTA LIBERADA: 30 Litros de Gasolina (Autonomia entre 95 e 115km)")
-                elif 115 < autonomia <= 125:
-                    liberado = True
-                    litros = "35L"
-                    st.success("✅ COTA LIBERADA: 35 Litros de Gasolina (Autonomia entre 115 e 125km)")
-                else:
-                    st.error(f"❌ Bloqueado: Autonomia ({autonomia}km) fora das faixas permitidas.")
-
-    elif tipo_operacao == "🕒 Assunção de Serviço (Entrada de Turno / KM Inicial)":
-        liberado = True
-        status_reg = "Assunção de Serviço"
-        litros = "0L"
-        st.write("##### 🎙️ Ditado por Voz para Observações de Entrada:")
-        componente_ditado_voz("ditado_assuncao")
-        obs = st.text_input("Observações de Entrada (Cole aqui o texto ditado ou digite)")
-
-    elif tipo_operacao == "🚫 Informar que a Viatura Não Abasteceu Hoje (N/A)":
-        liberado = True
-        status_reg = "Não Abasteceu (N/A)"
-        litros = "N/A"
-        motivo_nao = st.selectbox("Motivo de Não Abastecer:", [
-            "Autonomia suficiente para o turno", 
-            "Viatura em Manutenção / Oficina",
-            "Viatura de Reserva / Parada",
-            "Viatura Cedida / Emprestada",
-            "Cota não liberada"
-        ])
-        obs = motivo_nao
-
-    if st.button("💾 Gravar Registro no Sistema", use_container_width=True):
-        if not motorista:
-            st.warning("Informe o nome do motorista.")
-        elif tipo_operacao == "⛽ Realizar Abastecimento" and not liberado:
-            st.error("Informe a quantidade de litros ou uma autonomia dentro da cota autorizada.")
-        else:
-            caminho_foto = salvar_foto(foto_capturada, prefixo, status_reg[:5])
-            c = conn.cursor()
-            c.execute("""
-                INSERT OR IGNORE INTO abastecimentos 
-                (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, foto_painel, observacao) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (data.strftime("%Y-%m-%d"), prefixo, motorista, km_atual, litros, hora.strftime("%H:%M"), status_reg, caminho_foto, obs))
-            conn.commit()
-            st.success(f"✅ Registro de **{status_reg}** ({litros}) gravado com sucesso às {hora.strftime('%H:%M')} (Horário de Manaus)!")
-
-# 4. CORRIGIR / EDITAR LANÇAMENTO
-elif menu == "✏️ Corrigir / Editar Lançamento":
-    st.subheader("✏️ Correção e Edição de Lançamentos Anteriores")
-    st.info("Ajuste horários, quilometragens ou quantidades de litros de lançamentos passados:")
-    
-    df_todos = pd.read_sql_query("SELECT id, data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao FROM abastecimentos ORDER BY data DESC, horario DESC, id DESC", conn)
-    
-    if not df_todos.empty:
-        opcoes_regs = [f"ID {r['id']} | [{r['status_registro']}] {r['data']} {r['horario']} | VTR: {r['prefixo']} | KM: {r['km_atual']} | Litros: {r['litros_liberados']} | Mot: {r['motorista']}" for _, r in df_todos.iterrows()]
-        escolha = st.selectbox("Selecione o registro para editar:", opcoes_regs)
-        
-        reg_id = int(escolha.split(" | ")[0].replace("ID ", ""))
-        item = df_todos[df_todos['id'] == reg_id].iloc[0]
-        
-        st.write("---")
-        with st.form("form_edicao"):
-            col_e1, col_e2 = st.columns(2)
-            with col_e1:
-                vtr_edit = st.selectbox("Prefixo da Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"], index=["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"].index(item['prefixo']) if item['prefixo'] in ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"] else 0)
-                mot_edit = st.text_input("Motorista", value=str(item['motorista']))
-                km_edit = st.number_input("KM Odômetro", value=float(item['km_atual']), step=1.0)
-                status_edit = st.selectbox("Classificação do Registro", ["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"], index=["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"].index(item['status_registro']) if item['status_registro'] in ["Abastecido", "Assunção de Serviço", "Não Abasteceu (N/A)"] else 0)
-            with col_e2:
-                try:
-                    data_val = datetime.datetime.strptime(item['data'], "%Y-%m-%d").date()
-                except:
-                    data_val = get_agora_manaus().date()
-                data_edit = st.date_input("Data", value=data_val)
-                
-                try:
-                    hora_val = datetime.datetime.strptime(item['horario'], "%H:%M").time()
-                except:
-                    hora_val = get_agora_manaus().time()
-                hora_edit = st.time_input("Horário Correto", value=hora_val)
-                
-                litros_edit = st.text_input("Quantidade de Litros (Ex: 50L ou N/A)", value=str(item['litros_liberados']))
-                obs_edit = st.text_input("Observação / Motivo da Correção", value=str(item['observacao']) if item['observacao'] else "")
-                
-            c_btn1, c_btn2 = st.columns(2)
-            with c_btn1:
-                salvar_edit = st.form_submit_button("💾 Salvar Alterações Corrigidas", use_container_width=True)
-            with c_btn2:
-                excluir = st.form_submit_button("🗑️ Excluir Este Registro", use_container_width=True)
-                
-            if salvar_edit:
-                c = conn.cursor()
-                c.execute("""
-                    UPDATE abastecimentos 
-                    SET data = ?, horario = ?, prefixo = ?, motorista = ?, km_atual = ?, litros_liberados = ?, status_registro = ?, observacao = ?
-                    WHERE id = ?
-                """, (data_edit.strftime("%Y-%m-%d"), hora_edit.strftime("%H:%M"), vtr_edit, mot_edit, km_edit, litros_edit, status_edit, obs_edit, reg_id))
-                conn.commit()
-                st.success("✅ Registro atualizado com sucesso!")
-                st.rerun()
-                
-            if excluir:
-                c = conn.cursor()
-                c.execute("DELETE FROM abastecimentos WHERE id = ?", (reg_id,))
-                conn.commit()
-                st.warning("🗑️ Registro excluído com sucesso!")
-                st.rerun()
-    else:
-        st.info("Nenhum lançamento encontrado para edição.")
-
-# 5. STATUS & REVISÕES
-elif menu == "🛠️ Status da Frota & Revisões":
-    st.subheader("🛠️ Monitoramento de Manutenção Preventiva")
-    df_vtr = pd.read_sql_query("SELECT * FROM viaturas", conn)
-    
-    ultimos_kms = []
-    restantes = []
-    alertas = []
-    for _, row in df_vtr.iterrows():
-        pref = row['prefixo']
-        res = conn.execute("SELECT km_atual FROM abastecimentos WHERE prefixo = ? AND km_atual > 0 ORDER BY data DESC, horario DESC, km_atual DESC LIMIT 1", (pref,)).fetchone()
-        km_atual = res[0] if res else 0.0
-        prox_rev = row['km_proxima_revisao']
-        km_restante = prox_rev - km_atual
-        
-        ultimos_kms.append(km_atual)
-        restantes.append(km_restante)
-        
-        if row['status'] == 'Emprestada':
-            alertas.append("Emprestada")
-        elif km_restante <= 500:
-            alertas.append("🚨 CRÍTICO: Revisão Urgente")
-        elif km_restante <= 1500:
-            alertas.append("⚠️ ATENÇÃO: Revisão Próxima")
-        else:
-            alertas.append("✅ Regular")
-
-    df_vtr['KM Atual'] = ultimos_kms
-    df_vtr['KM Restante p/ Revisão'] = restantes
-    df_vtr['Status Revisão'] = alertas
-    
-    st.dataframe(df_vtr[['prefixo', 'modelo', 'placa', 'status', 'KM Atual', 'km_proxima_revisao', 'KM Restante p/ Revisão', 'Status Revisão']], use_container_width=True)
-
-# 6. OCORRÊNCIAS / AVARIAS
-elif menu == "📋 Livro de Ocorrências / Avarias":
-    st.subheader("📋 Registro de Alterações, Arranhões e Sinistros")
-    tab1, tab2 = st.tabs(["✍️ Digitação & Voz", "📄 Importar do Word (.docx)"])
-    
-    with tab1:
-        st.write("##### 🎙️ Ditado por Voz para Relato da Avaria:")
-        componente_ditado_voz("ditado_avaria")
-        
-        with st.form("form_ocorrencia_manual"):
-            col1, col2 = st.columns(2)
-            with col1:
-                prefixo_oc = st.selectbox("Viatura", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"], key="pref_m")
-                tipo_oc = st.selectbox("Tipo de Ocorrência", ["Arranhão/Avaria Leve", "Sinistro/Colisão", "Problema Mecânico/Elétrico", "Cautela/Empréstimo", "Outro"], key="tipo_m")
-                motorista_oc = st.text_input("Policial / Motorista Envolvido", key="mot_m")
-            with col2:
-                data_oc = st.date_input("Data do Ocorrido", get_agora_manaus().date(), key="data_m")
-                descricao = st.text_area("Descrição Detalhada (Cole aqui o texto ditado ou digite)", placeholder="Descreva o arranhão, sinistro ou alteração...", key="desc_m")
-                
-            if st.form_submit_button("Salvar Registro"):
-                if not descricao:
-                    st.warning("Preencha a descrição da alteração.")
-                else:
-                    c = conn.cursor()
-                    c.execute("INSERT INTO ocorrencias (data_hora, prefixo, tipo, descricao, motorista) VALUES (?, ?, ?, ?, ?)",
-                              (data_oc.strftime("%Y-%m-%d"), prefixo_oc, tipo_oc, descricao, motorista_oc))
-                    conn.commit()
-                    st.success("Ocorrência registrada com sucesso!")
-
-    with tab2:
-        st.write("Faça o upload do relatório salvo em formato Word (.docx):")
-        arquivo_word = st.file_uploader("Selecione o arquivo Word", type=["docx"])
-        
-        if arquivo_word is not None:
-            doc = docx.Document(arquivo_word)
-            texto_extraido = "\n".join([p.text.strip() for p in doc.paragraphs if p.text.strip()])
-            st.text_area("Texto Lido do Arquivo:", value=texto_extraido, height=150)
-            
-            col_w1, col_w2 = st.columns(2)
-            with col_w1:
-                pref_w = st.selectbox("Viatura do Documento", ["25-1001", "25-1111", "25-1329", "25-1353", "25-1394"], key="pref_w")
-                tipo_w = st.selectbox("Tipo", ["Avaria/Livro de Alterações", "Sinistro", "Manutenção", "Outro"], key="tipo_w")
-            with col_w2:
-                mot_w = st.text_input("Policial / Responsável", key="mot_w")
-                data_w = st.date_input("Data", get_agora_manaus().date(), key="data_w")
-                
-            if st.button("Gravar Histórico do Word no Sistema"):
-                c = conn.cursor()
-                c.execute("INSERT INTO ocorrencias (data_hora, prefixo, tipo, descricao, motorista) VALUES (?, ?, ?, ?, ?)",
-                          (data_w.strftime("%Y-%m-%d"), pref_w, tipo_w, texto_extraido, mot_w))
-                conn.commit()
-                st.success("Conteúdo do Word gravado com sucesso no livro de alterações!")
-
-    st.write("---")
-    df_oc = pd.read_sql_query("SELECT data_hora as Data, prefixo as Viatura, tipo as Tipo, motorista as Envolvido, descricao as Detalhes FROM ocorrencias ORDER BY id DESC", conn)
-    st.dataframe(df_oc, use_container_width=True)
-
-# 7. CONSULTA, FOTOS & EXPORTAÇÃO
-elif menu == "🔎 Consulta, Fotos & Exportação":
-    st.subheader("🔎 Consulta em Ordem Cronológica e Exportação")
-    
-    # Ordem cronológica: mais recente primeiro na visualização em tela
-    df_abast = pd.read_sql_query("""
-        SELECT id, data as Data, prefixo as Viatura, motorista as Motorista, 
-               km_atual as [KM Odômetro], litros_liberados as [Qtd Liberada], 
-               horario as Horário, status_registro as [Tipo Evento], 
-               observacao as [Motivo/Obs], foto_painel
-        FROM abastecimentos 
-        ORDER BY data DESC, horario DESC, id DESC
-    """, conn)
-    
-    if not df_abast.empty:
-        col_f1, col_f2, col_f3 = st.columns(3)
-        with col_f1:
-            filtro_vtr = st.selectbox("Filtrar Viatura", ["Todas"] + list(df_abast['Viatura'].unique()))
-        with col_f2:
-            filtro_motorista = st.text_input("Filtrar Motorista")
-        with col_f3:
-            filtro_data = st.date_input("Filtrar Data Específica", value=None)
-            
-        df_filtrado = df_abast.copy()
-        if filtro_vtr != "Todas":
-            df_filtrado = df_filtrado[df_filtrado['Viatura'] == filtro_vtr]
-        if filtro_motorista:
-            df_filtrado = df_filtrado[df_filtrado['Motorista'].str.contains(filtro_motorista, case=False, na=False)]
-        if filtro_data is not None:
-            df_filtrado = df_filtrado[df_filtrado['Data'] == filtro_data.strftime("%Y-%m-%d")]
-
-        tab_abast, tab_assuncao, tab_nao, tab_todos = st.tabs([
-            "⛽ Abastecimentos Reais", 
-            "🕒 Assunção de Serviço (KM Inicial)", 
-            "🚫 Não Abasteceu (N/A)", 
-            "📋 Todos os Eventos"
-        ])
-        
-        colunas_exibir = [c for c in df_filtrado.columns if c not in ['id', 'foto_painel']]
-        
-        with tab_abast:
-            df_aba_abast = df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido']
-            st.write(f"**Total de Abastecimentos Registrados:** {len(df_aba_abast)}")
-            st.dataframe(df_aba_abast[colunas_exibir], use_container_width=True)
-            
-            fotos_abast = df_aba_abast[df_aba_abast['foto_painel'].notna() & (df_aba_abast['foto_painel'] != '')]
-            if not fotos_abast.empty:
-                st.write("##### 📸 Comprovações Fotográficas dos Abastecimentos")
-                cols = st.columns(3)
-                for idx, (_, r_f) in enumerate(fotos_abast.iterrows()):
-                    if os.path.exists(str(r_f['foto_painel'])):
-                        with cols[idx % 3]:
-                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} às {r_f['Horário']} ({r_f['KM Odômetro']} km | {r_f['Qtd Liberada']})", use_container_width=True)
-
-        with tab_assuncao:
-            df_aba_assuncao = df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço']
-            st.write(f"**Total de Entradas de Plantão (KM Inicial):** {len(df_aba_assuncao)}")
-            st.dataframe(df_aba_assuncao[colunas_exibir], use_container_width=True)
-            
-            fotos_assuncao = df_aba_assuncao[df_aba_assuncao['foto_painel'].notna() & (df_aba_assuncao['foto_painel'] != '')]
-            if not fotos_assuncao.empty:
-                st.write("##### 📸 Fotos de Painel na Entrada do Turno")
-                cols = st.columns(3)
-                for idx, (_, r_f) in enumerate(fotos_assuncao.iterrows()):
-                    if os.path.exists(str(r_f['foto_painel'])):
-                        with cols[idx % 3]:
-                            st.image(r_f['foto_painel'], caption=f"{r_f['Viatura']} - {r_f['Data']} às {r_f['Horário']} (KM: {r_f['KM Odômetro']})", use_container_width=True)
-
-        with tab_nao:
-            df_aba_nao = df_filtrado[df_filtrado['Tipo Evento'] == 'Não Abasteceu (N/A)']
-            st.write(f"**Total de Justificativas (Sem Abastecer):** {len(df_aba_nao)}")
-            st.dataframe(df_aba_nao[colunas_exibir], use_container_width=True)
-
-        with tab_todos:
-            st.write(f"**Histórico Completo Consolidado:** {len(df_filtrado)}")
-            st.dataframe(df_filtrado[colunas_exibir], use_container_width=True)
-        
-        st.write("---")
-        
-        # Ordenação cronológica linear (do dia 1 ao 31) para o Excel baixado
-        df_exp_abast = df_filtrado[df_filtrado['Tipo Evento'] == 'Abastecido'][colunas_exibir].sort_values(by=['Data', 'Horário'], ascending=[True, True])
-        df_exp_assuncao = df_filtrado[df_filtrado['Tipo Evento'] == 'Assunção de Serviço'][colunas_exibir].sort_values(by=['Data', 'Horário'], ascending=[True, True])
-        
-        excel_bytes = converter_dfs_para_excel_multiplas_abas(df_exp_abast, df_exp_assuncao)
-        st.download_button(
-            label="📥 Baixar Planilha Excel Organizada (Ordem Cronológica)",
-            data=excel_bytes,
-            file_name="Relatorio_Frota_10CICOM_Cronologico.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.info("Nenhum dado encontrado.")
-
-# 8. IMPORTAR PLANILHA EXCEL
-elif menu == "📥 Importar Planilha Excel":
-    st.subheader("📥 Importar Dados de Planilha de Abastecimento (.xlsx)")
-    st.write("O sistema verifica e ignora automaticamente qualquer registro que já exista no banco.")
-
-    if st.button("🧹 Executar Faxina de Registros Duplicados no Banco"):
-        c = conn.cursor()
-        c.execute("""
-            DELETE FROM abastecimentos 
-            WHERE id NOT IN (
-                SELECT MIN(id) 
-                FROM abastecimentos 
-                GROUP BY data, prefixo, km_atual, horario, status_registro
-            )
-        """)
+    if limpar_antes:
+        cursor.execute("DELETE FROM abastecimentos WHERE origem = 'PLANILHA'")
         conn.commit()
-        st.success("✅ Banco de dados limpo! Todas as duplicidades foram removidas.")
-        st.rerun()
+
+    novos, duplicados = 0, 0
+    for reg in registros:
+        cursor.execute("""
+            SELECT COUNT(*) FROM abastecimentos 
+            WHERE prefixo = ? AND data = ? AND km_atual = ?
+        """, (reg["prefixo"], reg["data"], reg["km_atual"]))
+
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, placa, origem)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'PLANILHA')
+            """, (reg["prefixo"], reg["data"], reg["horario"], reg["km_atual"], reg["litros"], reg["motorista"], reg["placa"]))
+            novos += 1
+        else:
+            duplicados += 1
+
+    conn.commit()
+    conn.close()
+    return novos, duplicados
+
+def processar_planilha_local(limpar_antes=False):
+    arqs = glob.glob(f"{ARQUIVO_EXCEL}*") + glob.glob("*abastecimento*10*.*")
+    if not arqs:
+        return None, "Arquivo kms_abastecimento_10cicom.xlsx não encontrado."
+    arq = arqs[0]
+    try:
+        xl = pd.ExcelFile(arq)
+        aba_alvo = next((s for s in xl.sheet_names if "KMS" in s.upper() or "ABASTECIMENTO" in s.upper()), xl.sheet_names[0])
+        df_raw = xl.parse(aba_alvo, header=None)
+        registros = extrair_registros_10cicom(df_raw)
+        if not registros:
+            return None, "Nenhum registro extraído da planilha."
+        novos, duplicados = salvar_no_banco(registros, limpar_antes=limpar_antes)
+        return (arq, aba_alvo, len(registros), novos, duplicados), None
+    except Exception as e:
+        return None, str(e)
+
+# -----------------------------------------------------------------------------
+# PARSER DE MENSAGENS DO WHATSAPP
+# -----------------------------------------------------------------------------
+def extrair_dados_whatsapp(texto):
+    dados = {
+        "prefixo": None,
+        "km": 0,
+        "litros": 0.0,
+        "motorista": "",
+        "horario": agora_manaus().strftime("%H:%M"),
+        "observacao": ""
+    }
+    
+    # 1. Prefixo
+    vtr_match = re.search(r'(?:VTR|VIATURA|PREFIXO)[:\s]*([A-Za-z0-9\-\*]+)', texto, re.IGNORECASE)
+    if vtr_match:
+        nums = re.findall(r'\d{4}', vtr_match.group(1))
+        if nums:
+            dados["prefixo"] = f"25-{nums[0]}"
+    if not dados["prefixo"]:
+        for p in ["1001", "1111", "1329", "1353", "1394"]:
+            if p in texto:
+                dados["prefixo"] = f"25-{p}"
+                break
+                
+    # 2. KM
+    km_match = re.search(r'(?:KM|ODOMETRO|QUILOMETRAGEM)[:\s]*([0-9\.\,]+)', texto, re.IGNORECASE)
+    if km_match:
+        km_clean = km_match.group(1).replace('.', '').replace(',', '')
+        if km_clean.isdigit():
+            dados["km"] = int(km_clean)
+            
+    # 3. Litros
+    l_match = re.search(r'(?:LITROS|LT|LTS|QTDE|QUANTIDADE)[:\s]*([0-9\.\,]+)', texto, re.IGNORECASE)
+    if l_match:
+        try:
+            dados["litros"] = float(l_match.group(1).replace(',', '.'))
+        except:
+            pass
+            
+    # 4. Motorista
+    mot_match = re.search(r'(?:MOTORISTA|CONDUTOR|POLICIAL|FAROL)[:\s]*([^\n\r]+)', texto, re.IGNORECASE)
+    if mot_match:
+        dados["motorista"] = mot_match.group(1).strip()
+        
+    # 5. Horário
+    h_match = re.search(r'(?:HORA|HORARIO|HORÁRIO)[:\s]*([0-9]{1,2}[:hH][0-9]{2})', texto, re.IGNORECASE)
+    if h_match:
+        h = h_match.group(1).replace('h', ':').replace('H', ':')
+        if len(h) == 4 and h[1] == ':':
+            h = '0' + h
+        dados["horario"] = h[:5]
+        
+    # 6. Observação / Avaria
+    obs_match = re.search(r'(?:OBS|AVARIA|ALTERACAO|ALTERAÇÃO|OBSERVACAO|OBSERVAÇÃO)[:\s]*([^\n\r]+)', texto, re.IGNORECASE)
+    if obs_match:
+        dados["observacao"] = obs_match.group(1).strip()
+        
+    return dados
+
+# Carga automática se o banco estiver vazio
+conn_c = get_conexao()
+qtd = conn_c.cursor().execute("SELECT COUNT(*) FROM abastecimentos").fetchone()[0]
+conn_c.close()
+if qtd == 0:
+    processar_planilha_local()
+
+# -----------------------------------------------------------------------------
+# CONSULTAS AUXILIARES
+# -----------------------------------------------------------------------------
+def obter_viaturas():
+    conn = get_conexao()
+    df = pd.read_sql_query("SELECT * FROM viaturas ORDER BY prefixo ASC", conn)
+    conn.close()
+    return df
+
+def obter_historico(prefixo=None):
+    conn = get_conexao()
+    if prefixo and prefixo != "Todas":
+        q = "SELECT id, prefixo, data, horario, km_atual, litros, motorista, placa, observacao, origem FROM abastecimentos WHERE prefixo = ? ORDER BY data DESC, km_atual DESC, id DESC"
+        df = pd.read_sql_query(q, conn, params=(prefixo,))
+    else:
+        q = "SELECT id, prefixo, data, horario, km_atual, litros, motorista, placa, observacao, origem FROM abastecimentos ORDER BY data DESC, km_atual DESC, id DESC"
+        df = pd.read_sql_query(q, conn)
+    conn.close()
+    return df
+
+def obter_ocorrencias(status_filtro="Todas"):
+    conn = get_conexao()
+    if status_filtro != "Todas":
+        q = "SELECT * FROM ocorrencias WHERE status = ? ORDER BY id DESC"
+        df = pd.read_sql_query(q, conn, params=(status_filtro,))
+    else:
+        q = "SELECT * FROM ocorrencias ORDER BY id DESC"
+        df = pd.read_sql_query(q, conn)
+    conn.close()
+    return df
+
+# -----------------------------------------------------------------------------
+# INTERFACE DO USUÁRIO (STREAMLIT)
+# -----------------------------------------------------------------------------
+st.title("🚔 Frota Operacional — 10ª CICOM")
+st.caption(f"Horário Oficial de Manaus: {agora_manaus().strftime('%d/%m/%Y %H:%M:%S')} (Fuso UTC-4)")
+
+df_todos = obter_historico()
+
+# BARRA LATERAL COM BOTÕES DE SINCRONIZAÇÃO COMPLETA
+with st.sidebar:
+    st.header("⚙️ Painel Operacional")
+    filtro_vtr = st.selectbox("Filtrar Viatura:", ["Todas"] + obter_viaturas()['prefixo'].tolist())
+    st.write("---")
+    st.subheader("📥 Sincronização")
+    
+    if st.button("🔄 Recarregar Novos Dados", use_container_width=True):
+        res, erro = processar_planilha_local(limpar_antes=False)
+        if erro:
+            st.error(f"Erro: {erro}")
+        else:
+            arq, aba, total, novos, dups = res
+            st.success(f"Sincronizado! {total} registros mapeados (+{novos} novos).")
+            st.rerun()
+
+    if st.button("⚡ Limpar e Reimportar Tudo", type="primary", use_container_width=True, help="Limpa o banco e reimporta todos os dias de Agosto e Setembro da planilha"):
+        res, erro = processar_planilha_local(limpar_antes=True)
+        if erro:
+            st.error(f"Erro: {erro}")
+        else:
+            arq, aba, total, novos, dups = res
+            st.success(f"✅ Banco recarregado: {novos} lançamentos de Agosto e Setembro importados!")
+            st.rerun()
+
+# ABAS DO SISTEMA
+tab_dash, tab_whatsapp, tab_avarias, tab_hist, tab_lanca, tab_manut = st.tabs([
+    "📊 Visão Geral & Odômetros",
+    "📲 Ler Texto do WhatsApp",
+    "⚠️ Avarias & Ocorrências",
+    "📑 Histórico Cronológico",
+    "⛽ Lançamento Manual",
+    "🛠️ Revisões Preventivas"
+])
+
+# 1. DASHBOARD
+with tab_dash:
+    df_vtrs = obter_viaturas()
+    st.subheader("Odômetro Mais Recente da Frota (Agosto e Setembro)")
+    cols = st.columns(len(df_vtrs))
+    
+    for idx, vtr in df_vtrs.iterrows():
+        p = vtr['prefixo']
+        sub = df_todos[df_todos['prefixo'] == p]
+        km_ultimo = sub['km_atual'].iloc[0] if not sub.empty else 0
+        litros_total = sub['litros'].sum() if not sub.empty else 0
+        data_recente = sub['data'].iloc[0] if not sub.empty else "Sem registro"
+        
+        with cols[idx]:
+            st.metric(
+                label=f"VTR {p}",
+                value=f"{km_ultimo:,} km".replace(",", "."),
+                delta=f"{litros_total:.0f} L totais"
+            )
+            st.caption(f"**{vtr['modelo']}** | Placa: `{vtr['placa']}`\nÚltimo reg: `{data_recente}`")
 
     st.write("---")
-    arquivo_excel = st.file_uploader("Selecione o arquivo Excel", type=["xlsx", "xls", "XLSX", "XLS"])
+    st.subheader("Últimos Lançamentos Registrados")
+    st.dataframe(df_todos.head(15), use_container_width=True)
+
+# 2. LEITURA DE TEXTO DO WHATSAPP (ENTRADA DE SERVIÇO / ABASTECIMENTO)
+with tab_whatsapp:
+    st.subheader("📲 Leitura Automática de Texto do WhatsApp")
+    st.markdown("""
+    Cole abaixo a mensagem enviada pelo motorista no grupo de WhatsApp da 10ª CICOM. 
+    O sistema identificará a **Viatura, Odômetro, Litragem, Motorista, Horário** e eventuais **Avarias**.
+    """)
     
-    if arquivo_excel is not None:
-        if st.button("Processar e Carregar Dados"):
-            raw_df = pd.read_excel(arquivo_excel, header=None)
-            vtr_rows = {4: "25-1001", 5: "25-1111", 6: "25-1329", 7: "25-1353", 8: "25-1394"}
-            date_cols = [c for c in range(len(raw_df.columns)) if pd.notna(raw_df.iloc[2, c])]
+    txt_colado = st.text_area(
+        "Cole a mensagem do WhatsApp aqui:",
+        height=140,
+        placeholder="Exemplo:\n*ASSUNÇÃO DE SERVIÇO*\nVTR: 1001\nKM: 36.200\nLitros: 50L\nMotorista: CB PM SILVA\nHorário: 08:30\nObs: Farol esquerdo queimado"
+    )
+    
+    if st.button("🔍 Ler e Extrair Dados da Mensagem", type="primary", use_container_width=True):
+        if txt_colado.strip():
+            st.session_state['dados_zap'] = extrair_dados_whatsapp(txt_colado)
+            st.success("✅ Dados extraídos com sucesso! Confira e confirme abaixo:")
+        else:
+            st.warning("⚠️ Cole uma mensagem antes de clicar no botão.")
             
-            c = conn.cursor()
-            novos = 0
-            duplicados_ignorados = 0
+    if 'dados_zap' in st.session_state:
+        dz = st.session_state['dados_zap']
+        df_vtrs = obter_viaturas()
+        lista_vtrs = df_vtrs['prefixo'].tolist()
+        
+        idx_vtr = 0
+        if dz['prefixo'] in lista_vtrs:
+            idx_vtr = lista_vtrs.index(dz['prefixo'])
             
-            for col in date_cols:
-                d_val = raw_df.iloc[2, col]
-                if isinstance(d_val, pd.Timestamp):
-                    data_str = d_val.strftime("%Y-%m-%d")
-                else:
-                    d_s = str(d_val).strip()[:10]
-                    if '/' in d_s:
-                        partes = d_s.split('/')
-                        if len(partes) == 3:
-                            data_str = f"{partes[2]}-{partes[1].zfill(2)}-{partes[0].zfill(2)}"
-                        else:
-                            data_str = d_s
-                    else:
-                        data_str = d_s
+        with st.form("form_confirma_zap"):
+            st.markdown("##### Dados Extraídos para Validação:")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                vtr_sel = st.selectbox("Viatura:", lista_vtrs, index=idx_vtr)
+                data_sel = st.date_input("Data do Registro:", value=agora_manaus().date())
+            with c2:
+                km_val = st.number_input("Odômetro (KM):", value=dz['km'], step=1)
+                litros_val = st.number_input("Litros Abastecidos:", value=float(dz['litros']), step=0.1, format="%.2f")
+            with c3:
+                motorista_val = st.text_input("Motorista:", value=dz['motorista'] or "Turno Serviço")
+                hora_val = st.text_input("Horário (Manaus):", value=dz['horario'])
                 
-                for r, prefixo in vtr_rows.items():
-                    km = raw_df.iloc[r, col]
-                    motorista = raw_df.iloc[r, col+1] if col+1 < len(raw_df.columns) else ""
-                    qtde = raw_df.iloc[r, col+2] if col+2 < len(raw_df.columns) else ""
-                    horario = raw_df.iloc[r, col+3] if col+3 < len(raw_df.columns) else ""
-                    
-                    status_impor = "Abastecido"
-                    km_num = 0.0
-                    
-                    if str(km).strip() in ['N/A', 'N/I', '', 'nan']:
-                        status_impor = "Não Abasteceu (N/A)"
-                        qtde = "N/A"
-                    else:
-                        try:
-                            km_num = float(str(km).replace(',', '.').strip())
-                        except ValueError:
-                            status_impor = "Não Abasteceu (N/A)"
-                            
-                    mot_clean = str(motorista).strip()
-                    qtde_clean = str(qtde).strip()
-                    hora_clean = str(horario).strip()
-                    
-                    existe = c.execute("""
-                        SELECT id FROM abastecimentos 
-                        WHERE data = ? AND prefixo = ? AND (km_atual = ? OR horario = ?)
-                    """, (data_str, prefixo, km_num, hora_clean)).fetchone()
-                    
-                    if not existe:
-                        c.execute("""
-                            INSERT INTO abastecimentos 
-                            (data, prefixo, motorista, km_atual, litros_liberados, horario, status_registro, observacao)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (data_str, prefixo, mot_clean, km_num, qtde_clean, hora_clean, status_impor, "Importado da Planilha"))
-                        novos += 1
-                    else:
-                        duplicados_ignorados += 1
-
-            conn.commit()
+            obs_val = st.text_input("Observação / Avaria Reportada:", value=dz['observacao'])
             
-            if novos > 0:
-                st.success(f"✅ Sucesso: {novos} novos registros importados! ({duplicados_ignorados} duplicados foram ignorados)")
+            salvar_zap = st.form_submit_button("💾 Confirmar e Gravar no Banco de Dados", use_container_width=True)
+            if salvar_zap:
+                conn = get_conexao()
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, observacao, origem)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'WHATSAPP')
+                """, (vtr_sel, data_sel.strftime('%Y-%m-%d'), hora_val, int(km_val), float(litros_val), motorista_val, obs_val))
+                
+                if obs_val.strip():
+                    cur.execute("""
+                        INSERT INTO ocorrencias (prefixo, data, tipo, descricao, status, registrado_por)
+                        VALUES (?, ?, 'Avaria / Alteração', ?, 'Pendente', ?)
+                    """, (vtr_sel, data_sel.strftime('%Y-%m-%d'), obs_val, motorista_val))
+                    
+                conn.commit()
+                conn.close()
+                st.success(f"✅ Lançamento da VTR {vtr_sel} gravado com sucesso!")
+                del st.session_state['dados_zap']
                 st.rerun()
-            else:
-                st.info(f"ℹ️ Nenhum registro novo. Todos os {duplicados_ignorados} registros da planilha já constam no sistema.")
 
-conn.close()
+# 3. AVARIAS & OCORRÊNCIAS
+with tab_avarias:
+    st.subheader("⚠️ Controle de Avarias e Ocorrências das Viaturas")
+    
+    col_cad, col_lista = st.columns([1, 1.6])
+    
+    with col_cad:
+        st.markdown("#### 📝 Registrar Nova Avaria")
+        df_vtrs = obter_viaturas()
+        with st.form("form_avaria", clear_on_submit=True):
+            av_vtr = st.selectbox("Viatura:", df_vtrs['prefixo'].tolist())
+            av_data = st.date_input("Data da Ocorrência:", value=agora_manaus().date())
+            av_tipo = st.selectbox("Tipo de Alteração:", [
+                "Mecânica / Motor",
+                "Elétrica / Farol / Sirene",
+                "Pneus / Alinhamento",
+                "Funilaria / Pintura / Batida",
+                "Ar-condicionado",
+                "Documentação / Cartão",
+                "Outros"
+            ])
+            av_desc = st.text_area("Descrição do Problema:", placeholder="Ex: Pneu dianteiro direito furado ou farol queimado.")
+            av_policial = st.text_input("Policial / Condutor Relatante:", placeholder="Ex: SGT PM CARDOSO")
+            
+            if st.form_submit_button("🚨 Salvar Registro de Avaria", use_container_width=True):
+                if av_desc.strip():
+                    conn = get_conexao()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO ocorrencias (prefixo, data, tipo, descricao, status, registrado_por)
+                        VALUES (?, ?, ?, ?, 'Pendente', ?)
+                    """, (av_vtr, av_data.strftime('%Y-%m-%d'), av_tipo, av_desc.strip(), av_policial.strip()))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Avaria da VTR {av_vtr} registrada com sucesso!")
+                    st.rerun()
+                else:
+                    st.warning("Descreva o problema antes de salvar.")
+
+    with col_lista:
+        st.markdown("#### 📋 Avarias Registradas")
+        filtro_status_avaria = st.radio("Exibir:", ["Todas", "Pendente", "Solucionado"], horizontal=True)
+        df_ocorr = obter_ocorrencias(filtro_status_avaria)
+        
+        if df_ocorr.empty:
+            st.info("Nenhuma avaria cadastrada neste status.")
+        else:
+            for _, row in df_ocorr.iterrows():
+                id_oc = row['id']
+                status_icon = "🔴" if row['status'] == "Pendente" else "🟢"
+                with st.expander(f"{status_icon} VTR {row['prefixo']} | {row['tipo']} ({row['data']})"):
+                    st.write(f"**Descrição:** {row['descricao']}")
+                    st.write(f"**Relatado por:** {row['registrado_por']}")
+                    st.write(f"**Status Atual:** {row['status']}")
+                    
+                    if row['status'] == 'Pendente':
+                        if st.button(f"✅ Marcar como Solucionado / Reparado", key=f"btn_res_{id_oc}"):
+                            conn = get_conexao()
+                            cur = conn.cursor()
+                            cur.execute("UPDATE ocorrencias SET status = 'Solucionado' WHERE id = ?", (id_oc,))
+                            conn.commit()
+                            conn.close()
+                            st.success("Ocorrência atualizada para SOLUCIONADO!")
+                            st.rerun()
+
+# 4. HISTÓRICO COMPLETO (AGORÁ COM TODAS AS DATAS E ORDENAÇÃO EXATA)
+with tab_hist:
+    st.subheader(f"Histórico Completo de Abastecimentos ({filtro_vtr})")
+    df_filtrado = obter_historico(filtro_vtr)
+    
+    if not df_filtrado.empty:
+        total_regs = len(df_filtrado)
+        data_min = df_filtrado['data'].min()
+        data_max = df_filtrado['data'].max()
+        st.caption(f"Exibindo **{total_regs}** lançamentos de **{data_min}** até **{data_max}**.")
+        
+    st.dataframe(df_filtrado, use_container_width=True)
+    
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_filtrado.to_excel(writer, index=False, sheet_name='Abastecimentos')
+        
+    st.download_button(
+        label="📥 Baixar Histórico em Excel (.xlsx)",
+        data=buffer.getvalue(),
+        file_name=f"frota_10cicom_{agora_manaus().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# 5. LANÇAMENTO MANUAL
+with tab_lanca:
+    st.subheader("Novo Lançamento Manual (Manaus UTC-4)")
+    with st.form("form_manual", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sel_vtr = st.selectbox("Viatura:", obter_viaturas()['prefixo'].tolist())
+            dt_lanc = st.date_input("Data:", value=agora_manaus().date())
+        with c2:
+            hr_lanc = st.time_input("Horário:", value=agora_manaus().time())
+            mot_lanc = st.text_input("Policial / Motorista:", placeholder="Ex: SD RAMON")
+        with c3:
+            km_lanc = st.number_input("Odômetro (KM):", min_value=0, step=1)
+            lt_lanc = st.number_input("Litros Abastecidos:", min_value=0.0, step=0.1, format="%.2f")
+
+        obs_lanc = st.text_input("Observação / Alteração:")
+
+        if st.form_submit_button("💾 Salvar Registro", use_container_width=True):
+            conn = get_conexao()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, observacao, origem)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'MANUAL')
+            """, (sel_vtr, dt_lanc.strftime('%Y-%m-%d'), hr_lanc.strftime('%H:%M'), int(km_lanc), float(lt_lanc), mot_lanc, obs_lanc))
+            conn.commit()
+            conn.close()
+            st.success(f"VTR {sel_vtr} gravada com sucesso!")
+            st.rerun()
+
+# 6. MANUTENÇÃO PREVENTIVA
+with tab_manut:
+    st.subheader("🛠️ Revisões Preventivas (Intervalo: 10.000 KM)")
+    df_vtrs = obter_viaturas()
+    
+    lista_m = []
+    for _, vtr in df_vtrs.iterrows():
+        p = vtr['prefixo']
+        sub = df_todos[df_todos['prefixo'] == p]
+        km_atual = sub['km_atual'].iloc[0] if not sub.empty else vtr['km_revisao_base']
+        base = vtr['km_revisao_base']
+        intervalo = vtr['intervalo_revisao']
+
+        prox = base + (((km_atual - base) // intervalo) + 1) * intervalo if km_atual >= base else base
+        restante = prox - km_atual
+
+        status = "🔴 URGENTE" if restante <= 0 else ("🟡 ATENÇÃO" if restante <= 1000 else "🟢 REGULAR")
+        lista_m.append({
+            "Viatura": p,
+            "Modelo": vtr['modelo'],
+            "KM Atual": f"{km_atual:,}".replace(",", "."),
+            "Próxima Revisão": f"{prox:,}".replace(",", "."),
+            "KM Restante": f"{restante:,} km".replace(",", "."),
+            "Situação": status
+        })
+    st.table(pd.DataFrame(lista_m))
+    
