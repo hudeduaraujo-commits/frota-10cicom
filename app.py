@@ -656,28 +656,114 @@ with tab_lanca:
 
 # 6. MANUTENÇÃO PREVENTIVA
 with tab_manut:
-    st.subheader("🛠️ Revisões Preventivas (Intervalo: 10.000 KM)")
-    df_vtrs = obter_viaturas()
-    
-    lista_m = []
-    for _, vtr in df_vtrs.iterrows():
-        p = vtr['prefixo']
-        sub = df_todos[df_todos['prefixo'] == p]
-        km_atual = sub['km_atual'].iloc[0] if not sub.empty else vtr['km_revisao_base']
-        base = vtr['km_revisao_base']
-        intervalo = vtr['intervalo_revisao']
+  st.subheader('🛠️ Controle de Revisões Preventivas (Intervalo: 10.000 KM)')
 
-        prox = base + (((km_atual - base) // intervalo) + 1) * intervalo if km_atual >= base else base
-        restante = prox - km_atual
+  # 1. Garantir correção das Spins 1329 e 1394 no banco de dados (Base = 0 para a 1ª revisão aos 10.000 km)
+  conn_rev = get_conexao()
+  cur_rev = conn_rev.cursor()
+  cur_rev.execute(
+      "UPDATE viaturas SET km_revisao_base = 0, intervalo_revisao = 10000 WHERE"
+      " prefixo IN ('25-1329', '25-1394') AND km_revisao_base > 10000"
+  )
+  conn_rev.commit()
+  conn_rev.close()
 
-        status = "🔴 URGENTE" if restante <= 0 else ("🟡 ATENÇÃO" if restante <= 1000 else "🟢 REGULAR")
-        lista_m.append({
-            "Viatura": p,
-            "Modelo": vtr['modelo'],
-            "KM Atual": f"{km_atual:,}".replace(",", "."),
-            "Próxima Revisão": f"{prox:,}".replace(",", "."),
-            "KM Restante": f"{restante:,} km".replace(",", "."),
-            "Situação": status
-        })
-    st.table(pd.DataFrame(lista_m))
-    
+  df_vtrs = obter_viaturas()
+  df_todos = obter_historico()
+
+  # 2. Tabela de Monitoramento da Frota
+  lista_m = []
+  for _, vtr in df_vtrs.iterrows():
+    p = vtr['prefixo']
+    sub = df_todos[df_todos['prefixo'] == p]
+    km_atual = (
+        sub['km_atual'].iloc[0] if not sub.empty else vtr['km_revisao_base']
+    )
+    base = vtr['km_revisao_base']
+    intervalo = (
+        vtr['intervalo_revisao'] if vtr['intervalo_revisao'] > 0 else 10000
+    )
+
+    # Cálculo da próxima revisão
+    if km_atual < intervalo and base == 0:
+      prox = 10000  # 1ª Revisão de Fábrica
+    else:
+      prox = (
+          base + (((km_atual - base) // intervalo) + 1) * intervalo
+          if km_atual >= base
+          else base
+      )
+
+    restante = prox - km_atual
+
+    if restante <= 0:
+      status = '🔴 VENCIDA / URGENTE'
+    elif restante <= 1000:
+      status = '🟡 ALERTA (< 1.000 km)'
+    else:
+      status = '🟢 REGULAR'
+
+    lista_m.append({
+        'Viatura': p,
+        'Modelo': vtr['modelo'],
+        'KM Atual': f'{km_atual:,}'.replace(',', '.'),
+        'Última Revisão (Base)': (
+            f'{base:,} km'.replace(',', '.') if base > 0 else 'Zero KM (Nova)'
+        ),
+        'Próxima Revisão': f'{prox:,}'.replace(',', '.'),
+        'Faltam': f'{restante:,} km'.replace(',', '.'),
+        'Situação': status,
+    })
+
+  st.dataframe(pd.DataFrame(lista_m), use_container_width=True)
+
+  st.write('---')
+
+  # 3. Formulário para Atualizar Parâmetros de Revisão Manualmente
+  st.markdown('#### ⚙️ Atualizar Dados de Revisão da Viatura')
+  st.caption(
+      'Use para registrar uma revisão que acabou de ser realizada ou ajustar a'
+      ' quilometragem base.'
+  )
+
+  with st.form('form_ajuste_revisao'):
+    col_v, col_base, col_int = st.columns(3)
+    with col_v:
+      vtr_escolhida = st.selectbox(
+          'Selecione a Viatura:', df_vtrs['prefixo'].tolist()
+      )
+    with col_base:
+      km_base_novo = st.number_input(
+          'KM da Última Revisão Feita (ou 0 se ainda não fez a 1ª):',
+          min_value=0,
+          step=1000,
+          value=0,
+      )
+    with col_int:
+      int_novo = st.number_input(
+          'Intervalo de Manutenção (Padrão: 10.000):',
+          min_value=1000,
+          step=1000,
+          value=10000,
+      )
+
+    if st.form_submit_button(
+        '💾 Atualizar Parâmetros da Viatura', use_container_width=True
+    ):
+      conn_up = get_conexao()
+      cur_up = conn_up.cursor()
+      cur_up.execute(
+          """
+                UPDATE viaturas 
+                SET km_revisao_base = ?, intervalo_revisao = ?
+                WHERE prefixo = ?
+            """,
+          (int(km_base_novo), int(int_novo), vtr_escolhida),
+      )
+      conn_up.commit()
+      conn_up.close()
+      st.success(
+          f'✅ Parâmetros da VTR {vtr_escolhida} atualizados com sucesso!'
+      )
+      st.rerun()
+      
