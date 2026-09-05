@@ -26,6 +26,38 @@ def agora_manaus():
 
 NOME_BANCO = "frota_10cicom.db"
 ARQUIVO_EXCEL = "kms_abastecimento_10cicom.xlsx"
+SENHA_PADRAO = "10cicom"
+
+# -----------------------------------------------------------------------------
+# AUTENTICAÇÃO POR SENHA (10cicom)
+# -----------------------------------------------------------------------------
+def verificar_login():
+    if "autenticado" not in st.session_state:
+        st.session_state["autenticado"] = False
+
+    if not st.session_state["autenticado"]:
+        col1, col2, col3 = st.columns([1, 1.2, 1])
+        with col2:
+            st.write("")
+            st.write("")
+            st.markdown("### 🚔 10ª CICOM — PMAM")
+            st.markdown("#### Sistema de Gestão de Frota Operacional")
+            st.info("Acesso restrito ao efetivo de serviço e administração.")
+            
+            with st.form("form_login"):
+                senha = st.text_input("Digite a senha de acesso:", type="password", placeholder="Informe a senha...")
+                btn_entrar = st.form_submit_button("🔓 Acessar Sistema", use_container_width=True)
+                
+                if btn_entrar:
+                    if senha == SENHA_PADRAO:
+                        st.session_state["autenticado"] = True
+                        st.success("Acesso autorizado com sucesso!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Senha incorreta. Tente novamente.")
+        st.stop()
+
+verificar_login()
 
 # -----------------------------------------------------------------------------
 # BANCO DE DADOS SQLITE & SCHEMA DEFENSIVO
@@ -137,7 +169,6 @@ inicializar_banco()
 # REGRAS DE CÁLCULO DE REVISÃO PREVENTIVA
 # -----------------------------------------------------------------------------
 def calcular_status_revisao(km_atual, km_base, intervalo=10000):
-    """Calcula a próxima revisão e quantos quilômetros restam."""
     if intervalo <= 0:
         intervalo = 10000
 
@@ -305,13 +336,14 @@ st.caption(f"Horário Oficial de Manaus: {agora_manaus().strftime('%d/%m/%Y %H:%
 df_vtrs = obter_viaturas()
 lista_prefixos = df_vtrs['prefixo'].tolist()
 
-# BARRA LATERAL COM AÇÕES DIRETAS
+# BARRA LATERAL
 with st.sidebar:
     st.header("⚙️ Painel Operacional")
     filtro_vtr = st.selectbox("Filtrar Viatura:", ["Todas"] + lista_prefixos)
     st.write("---")
-    st.subheader("🎯 Ações Rápidas")
-    st.info("Utilize as abas superiores para registrar Abastecimentos, Assunções de Serviço ou Lançamento de Revisões.")
+    if st.button("🔒 Sair do Sistema (Logout)", use_container_width=True):
+        st.session_state["autenticado"] = False
+        st.rerun()
 
 # ABAS DO SISTEMA
 abas_nomes = [
@@ -444,9 +476,7 @@ with tab_assuncao:
     mot_digitado = st.text_input("Motorista / Condutor:", value=dados_assuncao['motorista'], placeholder="Ex: CB PM SILVA", key="ass_mot_txt")
     obs_digitada = st.text_area("Observações da Viatura / Avarias Verificadas no Início:", value=dados_assuncao['observacao'], placeholder="Ex: Nível de óleo e água conferidos; lanterna esquerda trincada.", key="ass_obs_txt")
 
-    # -------------------------------------------------------------------------
-    # CÁLCULO AUTOMÁTICO DE REVISÃO EXIBIDO EM TEMPO REAL ANTES DE GRAVAR
-    # -------------------------------------------------------------------------
+    # Diagnóstico automático de revisão exibido em tempo real
     if km_digitado > 0:
         info_vtr = df_vtrs[df_vtrs['prefixo'] == vtr_selecionada].iloc[0]
         base_vtr = info_vtr['km_revisao_base']
@@ -473,19 +503,16 @@ with tab_assuncao:
         conn = get_conexao()
         cur = conn.cursor()
         
-        # 1. Grava na tabela de assunções
         cur.execute("""
             INSERT INTO assuncoes_servico (prefixo, data, horario, turno, cmt_guarnicao, motorista, km_inicial, observacao, origem)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (vtr_selecionada, data_digitada.strftime('%Y-%m-%d'), hora_digitada, turno_selecionado, cmt_digitado, mot_digitado, int(km_digitado), obs_digitada, dados_assuncao['origem']))
         
-        # 2. Alimenta o odômetro no histórico geral para manter a frota sincronizada
         cur.execute("""
             INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, observacao, origem)
             VALUES (?, ?, ?, ?, 0.0, ?, ?, ?)
         """, (vtr_selecionada, data_digitada.strftime('%Y-%m-%d'), hora_digitada, int(km_digitado), mot_digitado, f"Assunção ({turno_selecionado}) - {obs_digitada}".strip(), dados_assuncao['origem']))
 
-        # 3. Registra avaria se houver descrição de alteração
         if obs_digitada.strip() and obs_digitada.lower() not in ['sem alteracao', 'sem alteração', 'ok', 'tudo ok']:
             cur.execute("""
                 INSERT INTO ocorrencias (prefixo, data, tipo, descricao, status, registrado_por)
@@ -601,7 +628,7 @@ with tab_abast:
             st.rerun()
 
 # -----------------------------------------------------------------------------
-# 4. REGISTRO DE REVISÃO REALIZADA (NOVO BOTÃO / FLUXO OPERACIONAL)
+# 4. REGISTRO DE REVISÃO REALIZADA
 # -----------------------------------------------------------------------------
 with tab_reg_rev:
     st.subheader("🛠️ Registrar Revisão Mecânica Realizada")
@@ -632,13 +659,11 @@ with tab_reg_rev:
                 conn = get_conexao()
                 cur = conn.cursor()
                 
-                # 1. Registra no histórico de revisões
                 cur.execute("""
                     INSERT INTO historico_revisoes (prefixo, data, km_revisao, tipo_revisao, oficina, responsavel, observacoes)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (rev_vtr, rev_data.strftime('%Y-%m-%d'), int(rev_km), rev_tipo, rev_oficina, rev_resp, rev_obs))
                 
-                # 2. Atualiza a quilometragem base da viatura para recalibrar o cálculo automático
                 cur.execute("""
                     UPDATE viaturas 
                     SET km_revisao_base = ? 
