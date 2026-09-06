@@ -19,6 +19,21 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Injeção de CSS para estilizar botões verdes de sucesso
+st.markdown("""
+    <style>
+    div[data-testid="stButton"] button[kind="primary"] {
+        border-radius: 8px;
+    }
+    .btn-verde button {
+        background-color: #28a745 !important;
+        color: white !important;
+        border: 1px solid #28a745 !important;
+        font-weight: bold !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 FUSO_MANAUS = ZoneInfo("America/Manaus")
 
 def agora_manaus():
@@ -82,7 +97,7 @@ def inicializar_banco():
         )
     """)
     
-    # 2. Tabela de Abastecimentos
+    # 2. Tabela de Abastecimentos / Odômetro Geral
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS abastecimentos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +110,7 @@ def inicializar_banco():
             placa TEXT,
             observacao TEXT,
             origem TEXT DEFAULT 'MANUAL',
+            assuncao_id INTEGER DEFAULT NULL,
             FOREIGN KEY (prefixo) REFERENCES viaturas(prefixo)
         )
     """)
@@ -144,8 +160,13 @@ def inicializar_banco():
             FOREIGN KEY (prefixo) REFERENCES viaturas(prefixo)
         )
     """)
+
+    # Migração defensiva para garantir campo assuncao_id
+    cursor.execute("PRAGMA table_info(abastecimentos)")
+    colunas_abast = [c[1] for c in cursor.fetchall()]
+    if "assuncao_id" not in colunas_abast:
+        cursor.execute("ALTER TABLE abastecimentos ADD COLUMN assuncao_id INTEGER DEFAULT NULL")
     
-    # Carga inicial de Viaturas Ativas
     cursor.execute("SELECT COUNT(*) FROM viaturas")
     if cursor.fetchone()[0] == 0:
         viaturas_iniciais = [
@@ -210,7 +231,6 @@ def extrair_dados_whatsapp(texto):
         "observacao": ""
     }
     
-    # Prefixo
     vtr_match = re.search(r'(?:VTR|VIATURA|PREFIXO)[:\s]*([A-Za-z0-9\-\*]+)', texto, re.IGNORECASE)
     if vtr_match:
         nums = re.findall(r'\d{4}', vtr_match.group(1))
@@ -222,14 +242,12 @@ def extrair_dados_whatsapp(texto):
                 dados["prefixo"] = f"25-{p}"
                 break
                 
-    # Odômetro / KM
     km_match = re.search(r'(?:KM|ODOMETRO|QUILOMETRAGEM)[:\s]*([0-9\.\,]+)', texto, re.IGNORECASE)
     if km_match:
         km_clean = km_match.group(1).replace('.', '').replace(',', '')
         if km_clean.isdigit():
             dados["km"] = int(km_clean)
             
-    # Litros
     l_match = re.search(r'(?:LITROS|LT|LTS|QTDE|QUANTIDADE)[:\s]*([0-9\.\,]+)', texto, re.IGNORECASE)
     if l_match:
         try:
@@ -237,17 +255,14 @@ def extrair_dados_whatsapp(texto):
         except:
             pass
             
-    # Motorista
     mot_match = re.search(r'(?:MOTORISTA|CONDUTOR|POLICIAL|FAROL)[:\s]*([^\n\r]+)', texto, re.IGNORECASE)
     if mot_match:
         dados["motorista"] = mot_match.group(1).strip()
         
-    # Comandante de Guarnição
     cmt_match = re.search(r'(?:CMT|COMANDANTE|CHEFE|ENCARREGADO)[:\s]*([^\n\r]+)', texto, re.IGNORECASE)
     if cmt_match:
         dados["cmt_guarnicao"] = cmt_match.group(1).strip()
 
-    # Horário
     h_match = re.search(r'(?:HORA|HORARIO|HORÁRIO)[:\s]*([0-9]{1,2}[:hH][0-9]{2})', texto, re.IGNORECASE)
     if h_match:
         h = h_match.group(1).replace('h', ':').replace('H', ':')
@@ -255,7 +270,6 @@ def extrair_dados_whatsapp(texto):
             h = '0' + h
         dados["horario"] = h[:5]
         
-    # Observação / Avaria
     obs_match = re.search(r'(?:OBS|AVARIA|ALTERACAO|ALTERAÇÃO|OBSERVACAO|OBSERVAÇÃO)[:\s]*([^\n\r]+)', texto, re.IGNORECASE)
     if obs_match:
         dados["observacao"] = obs_match.group(1).strip()
@@ -286,10 +300,10 @@ def obter_viaturas():
 def obter_historico_abastecimentos(prefixo=None):
     conn = get_conexao()
     if prefixo and prefixo != "Todas":
-        q = "SELECT id, prefixo, data, horario, km_atual, litros, motorista, observacao, origem FROM abastecimentos WHERE prefixo = ? ORDER BY data DESC, km_atual DESC, id DESC"
+        q = "SELECT id, prefixo, data, horario, km_atual, litros, motorista, observacao, origem, assuncao_id FROM abastecimentos WHERE prefixo = ? ORDER BY data DESC, km_atual DESC, id DESC"
         df = pd.read_sql_query(q, conn, params=(prefixo,))
     else:
-        q = "SELECT id, prefixo, data, horario, km_atual, litros, motorista, observacao, origem FROM abastecimentos ORDER BY data DESC, km_atual DESC, id DESC"
+        q = "SELECT id, prefixo, data, horario, km_atual, litros, motorista, observacao, origem, assuncao_id FROM abastecimentos ORDER BY data DESC, km_atual DESC, id DESC"
         df = pd.read_sql_query(q, conn)
     conn.close()
     return df
@@ -327,50 +341,67 @@ def obter_ocorrencias(status_filtro="Todas"):
     conn.close()
     return df
 
-# -----------------------------------------------------------------------------
-# INTERFACE DO USUÁRIO
-# -----------------------------------------------------------------------------
-st.title("🚔 Frota Operacional — 10ª CICOM")
-st.caption(f"Horário Oficial de Manaus: {agora_manaus().strftime('%d/%m/%Y %H:%M:%S')} (Fuso UTC-4)")
-
 df_vtrs = obter_viaturas()
 lista_prefixos = df_vtrs['prefixo'].tolist()
 
-# BARRA LATERAL
+# -----------------------------------------------------------------------------
+# BARRA LATERAL (MENU OPERACIONAL COM BOTÕES NA LATERAL ESQUERDA)
+# -----------------------------------------------------------------------------
+if "tela_ativa" not in st.session_state:
+    st.session_state["tela_ativa"] = "📊 Visão Geral & Odômetros"
+
 with st.sidebar:
-    st.header("⚙️ Painel Operacional")
+    st.markdown("### 🚔 10ª CICOM — PMAM")
+    st.caption(f"Fuso Oficial: UTC-4 (Manaus)\n{agora_manaus().strftime('%d/%m/%Y %H:%M')}")
+    st.write("---")
+
     filtro_vtr = st.selectbox("Filtrar Viatura:", ["Todas"] + lista_prefixos)
+    st.write("---")
+    st.markdown("#### 🔘 Módulos de Operação")
+
+    telas = [
+        ("📊 Visão Geral & Odômetros", "btn_menu_dash"),
+        ("🛡️ Assunção de Serviço", "btn_menu_assuncao"),
+        ("⛽ Registrar Abastecimento", "btn_menu_abast"),
+        ("✏️ Corrigir / Editar Lançamentos", "btn_menu_corrigir"),
+        ("🛠️ Registrar Revisão Realizada", "btn_menu_rev"),
+        ("⚠️ Avarias & Ocorrências", "btn_menu_avarias"),
+        ("📑 Histórico Completo", "btn_menu_hist"),
+        ("🔍 Monitor de Revisões", "btn_menu_monit")
+    ]
+
+    for label, chave in telas:
+        estilo = "primary" if st.session_state["tela_ativa"] == label else "secondary"
+        if st.button(label, key=chave, use_container_width=True, type=estilo):
+            st.session_state["tela_ativa"] = label
+            # Limpa estados de gravação anterior ao alternar telas
+            st.session_state.pop("gravado_assuncao", None)
+            st.session_state.pop("gravado_abastecimento", None)
+            st.rerun()
+
     st.write("---")
     if st.button("🔒 Sair do Sistema (Logout)", use_container_width=True):
         st.session_state["autenticado"] = False
         st.rerun()
 
-# ABAS DO SISTEMA
-abas_nomes = [
-    "📊 Visão Geral & Odômetros",
-    "🛡️ Assunção de Serviço",
-    "⛽ Registrar Abastecimento",
-    "🛠️ Registrar Revisão",
-    "⚠️ Avarias & Ocorrências",
-    "📑 Histórico Completo",
-    "🔍 Quadro Geral de Revisões"
-]
+# Cabeçalho Principal
+st.title("🚔 Frota Operacional — 10ª CICOM")
+st.caption(f"Módulo Ativo: **{st.session_state['tela_ativa']}** | Horário Manaus: {agora_manaus().strftime('%d/%m/%Y %H:%M:%S')}")
+st.write("---")
 
-tab_dash, tab_assuncao, tab_abast, tab_reg_rev, tab_avarias, tab_hist, tab_manut = st.tabs(abas_nomes)
-
-# -----------------------------------------------------------------------------
-# 1. DASHBOARD GERAL
-# -----------------------------------------------------------------------------
-with tab_dash:
+# =============================================================================
+# TELA 1: DASHBOARD GERAL
+# =============================================================================
+if st.session_state["tela_ativa"] == "📊 Visão Geral & Odômetros":
     df_todos_abast = obter_historico_abastecimentos()
-    st.subheader("Odômetro Mais Recente da Frota & Situação de Revisão")
+    st.subheader("Odômetro Mais Recente da Frota & Diagnóstico de Revisão")
     cols = st.columns(len(df_vtrs))
     
     for idx, vtr in df_vtrs.iterrows():
         p = vtr['prefixo']
         sub = df_todos_abast[df_todos_abast['prefixo'] == p]
         km_ultimo = sub['km_atual'].iloc[0] if not sub.empty else vtr['km_revisao_base']
-        litros_total = sub['litros'].sum() if not sub.empty else 0
+        litros_total = sub[sub['litros'] > 0]['litros'].sum() if not sub.empty else 0
         data_recente = sub['data'].iloc[0] if not sub.empty else "Sem registro"
         
         prox_r, rest_r, st_r, _ = calcular_status_revisao(km_ultimo, vtr['km_revisao_base'], vtr['intervalo_revisao'])
@@ -387,24 +418,30 @@ with tab_dash:
     col_dash1, col_dash2 = st.columns(2)
     with col_dash1:
         st.markdown("##### 🛡️ Últimas Assunções de Serviço")
-        df_ass = obter_historico_assuncoes()
-        st.dataframe(df_ass.head(6), use_container_width=True)
+        st.dataframe(obter_historico_assuncoes().head(6), use_container_width=True)
     with col_dash2:
         st.markdown("##### ⛽ Últimos Abastecimentos")
-        st.dataframe(df_todos_abast.head(6), use_container_width=True)
+        st.dataframe(df_todos_abast[df_todos_abast['litros'] > 0].head(6), use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 2. REGISTRO DE ASSUNÇÃO DE SERVIÇO COM CÁLCULO IMEDIATO DE REVISÃO
-# -----------------------------------------------------------------------------
-with tab_assuncao:
+# =============================================================================
+# TELA 2: ASSUNÇÃO DE SERVIÇO COM BOTÃO VERDE DE SUCESSO
+# =============================================================================
+elif st.session_state["tela_ativa"] == "🛡️ Assunção de Serviço":
     st.subheader("🛡️ Registro de Assunção de Serviço da Viatura")
     st.caption("Cadastre a entrada de serviço. O sistema calcula na hora se a viatura está dentro do limite de revisão.")
 
+    # Exibe badge de sucesso e botão verde se acabou de ser gravado
+    ja_gravou_ass = st.session_state.get("gravado_assuncao", False)
+    if ja_gravou_ass:
+        st.success(f"🎉 **Assunção de Serviço Homologada com Sucesso!** VTR {st.session_state.get('ultima_vtr_ass')} registrada.")
+        if st.button("➕ Realizar Outra Assunção", key="btn_novo_ass"):
+            st.session_state["gravado_assuncao"] = False
+            st.rerun()
+
     metodo_assuncao = st.radio(
-        "Método de Registro da Assunção:",
+        "Método de Entrada:",
         ["✍️ Manual", "📷 Leitura de Foto do Painel", "💬 Texto do WhatsApp"],
-        horizontal=True,
-        key="radio_metodo_assuncao"
+        horizontal=True
     )
 
     dados_assuncao = {
@@ -421,11 +458,11 @@ with tab_assuncao:
 
     if metodo_assuncao == "💬 Texto do WhatsApp":
         txt_assuncao = st.text_area(
-            "Cole a mensagem padrão de assunção de serviço do WhatsApp:",
-            height=120,
-            placeholder="Exemplo:\n*ASSUNÇÃO DE SERVIÇO*\nTurno: 1º Turno (07h às 19h)\nVTR: 1001\nKM Inicial: 44.200\nCmt: SGT PM CARDOSO\nMotorista: CB PM SILVA\nObs: Farol dianteiro direito com lâmpada fraca"
+            "Cole a mensagem de assunção do WhatsApp:",
+            height=110,
+            placeholder="Exemplo:\n*ASSUNÇÃO DE SERVIÇO*\nTurno: 1º Turno (07h às 19h)\nVTR: 1001\nKM: 44.200\nCmt: SGT PM CARDOSO\nMotorista: CB PM SILVA\nObs: Sem alterações"
         )
-        if st.button("🔍 Processar Mensagem WhatsApp", key="btn_proc_assuncao"):
+        if st.button("🔍 Processar Mensagem WhatsApp", key="btn_p_ass"):
             if txt_assuncao.strip():
                 st.session_state['assuncao_ext'] = extrair_dados_whatsapp(txt_assuncao)
                 st.success("Mensagem processada com sucesso!")
@@ -444,100 +481,108 @@ with tab_assuncao:
     elif metodo_assuncao == "📷 Leitura de Foto do Painel":
         c_p1, c_p2 = st.columns([1, 1])
         with c_p1:
-            foto_painel_ass = st.file_uploader("Upload da foto do odômetro na assunção:", type=['jpg', 'jpeg', 'png'], key="up_foto_ass")
-            foto_camera_ass = st.camera_input("Ou fotografe o odômetro pelo celular:", key="cam_foto_ass")
-            
-            foto_usar_ass = foto_camera_ass or foto_painel_ass
-            if foto_usar_ass:
-                km_detectado = extrair_km_imagem_ocr(foto_usar_ass.getvalue())
-                if km_detectado > 0:
-                    dados_assuncao['km'] = km_detectado
-                    st.success(f"Odômetro detectado: {km_detectado:,} KM".replace(',', '.'))
+            foto_ass = st.file_uploader("Upload da foto do painel/odômetro:", type=['jpg', 'jpeg', 'png'], key="f_up_ass")
+            foto_cam_ass = st.camera_input("Fotografar odômetro:", key="f_cam_ass")
+            foto_u_ass = foto_cam_ass or foto_ass
+            if foto_u_ass:
+                km_det = extrair_km_imagem_ocr(foto_u_ass.getvalue())
+                if km_det > 0:
+                    dados_assuncao['km'] = km_det
+                    st.success(f"Odômetro detectado: {km_det:,} KM".replace(',', '.'))
                 dados_assuncao['origem'] = "FOTO_PAINEL"
         with c_p2:
-            if foto_usar_ass:
-                st.image(foto_usar_ass, caption="Foto do Painel anexada", use_container_width=True)
+            if foto_u_ass:
+                st.image(foto_u_ass, caption="Foto do Painel anexada", use_container_width=True)
 
     st.write("---")
     st.markdown("##### 📝 Formulário de Confirmação da Assunção de Serviço")
-    
     c1, c2, c3 = st.columns(3)
     with c1:
         idx_vtr_a = lista_prefixos.index(dados_assuncao['prefixo']) if dados_assuncao['prefixo'] in lista_prefixos else 0
-        vtr_selecionada = st.selectbox("Viatura:", lista_prefixos, index=idx_vtr_a, key="ass_vtr_sel")
-        turno_selecionado = st.selectbox("Turno de Serviço:", ["1º Turno (07h às 19h)", "2º Turno (19h às 07h)", "Turno Extra / Operação Especial"], key="ass_turno_sel")
+        vtr_sel = st.selectbox("Viatura:", lista_prefixos, index=idx_vtr_a, key="as_vtr")
+        turno_sel = st.selectbox("Turno de Serviço:", ["1º Turno (07h às 19h)", "2º Turno (19h às 07h)", "Turno Extra / Operação Especial"], key="as_trn")
     with c2:
-        data_digitada = st.date_input("Data:", value=dados_assuncao['data'], key="ass_dt_sel")
-        hora_digitada = st.text_input("Horário (Manaus):", value=dados_assuncao['horario'], key="ass_hr_sel")
+        dt_sel = st.date_input("Data:", value=dados_assuncao['data'], key="as_dt")
+        hr_sel = st.text_input("Horário (Manaus):", value=dados_assuncao['horario'], key="as_hr")
     with c3:
-        km_digitado = st.number_input("KM Inicial (Odômetro Atual):", value=int(dados_assuncao['km']), step=1, key="ass_km_num")
-        cmt_digitado = st.text_input("Comandante da Guarnição:", value=dados_assuncao['cmt_guarnicao'], placeholder="Ex: TEN PM MOURA / SGT PM CARDOSO", key="ass_cmt_txt")
+        km_sel = st.number_input("KM Inicial (Odômetro Atual):", value=int(dados_assuncao['km']), step=1, key="as_km")
+        cmt_sel = st.text_input("Comandante da Guarnição:", value=dados_assuncao['cmt_guarnicao'], placeholder="Ex: SGT PM CARDOSO", key="as_cmt")
 
-    mot_digitado = st.text_input("Motorista / Condutor:", value=dados_assuncao['motorista'], placeholder="Ex: CB PM SILVA", key="ass_mot_txt")
-    obs_digitada = st.text_area("Observações da Viatura / Avarias Verificadas no Início:", value=dados_assuncao['observacao'], placeholder="Ex: Nível de óleo e água conferidos; lanterna esquerda trincada.", key="ass_obs_txt")
+    mot_sel = st.text_input("Motorista / Condutor:", value=dados_assuncao['motorista'], placeholder="Ex: CB PM SILVA", key="as_mot")
+    obs_sel = st.text_area("Observações da Viatura / Avarias na Entrada:", value=dados_assuncao['observacao'], placeholder="Ex: Nível de óleo e água checados; sem alterações.", key="as_obs")
 
-    # Diagnóstico automático de revisão exibido em tempo real
-    if km_digitado > 0:
-        info_vtr = df_vtrs[df_vtrs['prefixo'] == vtr_selecionada].iloc[0]
-        base_vtr = info_vtr['km_revisao_base']
-        int_vtr = info_vtr['intervalo_revisao']
-        
-        prox_rev, faltam_km, sit_rev, classe_rev = calcular_status_revisao(km_digitado, base_vtr, int_vtr)
+    if km_sel > 0:
+        info_vtr = df_vtrs[df_vtrs['prefixo'] == vtr_sel].iloc[0]
+        prox_rev, faltam_km, sit_rev, _ = calcular_status_revisao(km_sel, info_vtr['km_revisao_base'], info_vtr['intervalo_revisao'])
 
-        st.markdown("#### 🔍 Diagnóstico Automático de Manutenção Preventiva:")
-        c_diag1, c_diag2, c_diag3 = st.columns(3)
-        c_diag1.metric("KM Informado pelo Motorista", f"{km_digitado:,} km".replace(",", "."))
-        c_diag2.metric("Próxima Revisão Prevista", f"{prox_rev:,} km".replace(",", "."))
-        
+        st.markdown("#### 🔍 Diagnóstico Automático de Revisão:")
+        cd1, cd2, cd3 = st.columns(3)
+        cd1.metric("KM Informado pelo Motorista", f"{km_sel:,} km".replace(",", "."))
+        cd2.metric("Próxima Revisão Prevista", f"{prox_rev:,} km".replace(",", "."))
         if faltam_km <= 0:
-            c_diag3.metric("Situação", sit_rev, delta=f"Vencida há {abs(faltam_km):,} km".replace(",", "."), delta_color="inverse")
-            st.error(f"🚨 **ATENÇÃO GUARNICAO / COMANDO:** A VTR {vtr_selecionada} ultrapassou o limite para revisão em **{abs(faltam_km):,} KM**. Solicitar encaminhamento à oficina credenciada.")
+            cd3.metric("Situação", sit_rev, delta=f"Vencida há {abs(faltam_km):,} km".replace(",", "."), delta_color="inverse")
+            st.error(f"🚨 **URGENTE:** A VTR {vtr_sel} excedeu o limite de revisão preventiva em **{abs(faltam_km):,} KM**.")
         elif faltam_km <= 1000:
-            c_diag3.metric("Faltam para Revisão", f"{faltam_km:,} km".replace(",", "."), delta="Atenção: Menos de 1.000 km!", delta_color="inverse")
-            st.warning(f"⚠️ **ALERTA DE REVISÃO PRÓXIMA:** Faltam apenas **{faltam_km:,} KM** para a próxima revisão preventiva da VTR {vtr_selecionada}.")
+            cd3.metric("Faltam para Revisão", f"{faltam_km:,} km".replace(",", "."), delta="Atenção: Menos de 1.000 km!", delta_color="inverse")
+            st.warning(f"⚠️ **ALERTA:** Faltam apenas **{faltam_km:,} KM** para a próxima revisão da VTR {vtr_sel}.")
         else:
-            c_diag3.metric("Faltam para Revisão", f"{faltam_km:,} km".replace(",", "."), delta="Em dia / Regular")
-            st.success(f"✅ **SITUAÇÃO REGULAR:** A VTR {vtr_selecionada} possui **{faltam_km:,} KM** disponíveis até a próxima revisão.")
+            cd3.metric("Faltam para Revisão", f"{faltam_km:,} km".replace(",", "."), delta="Em dia")
+            st.success(f"✅ **REGULAR:** A VTR {vtr_sel} tem **{faltam_km:,} KM** restantes até a próxima revisão.")
 
-    if st.button("💾 Confirmar e Homologar Assunção de Serviço", type="primary", use_container_width=True, key="btn_gravar_assuncao"):
-        conn = get_conexao()
-        cur = conn.cursor()
-        
-        cur.execute("""
-            INSERT INTO assuncoes_servico (prefixo, data, horario, turno, cmt_guarnicao, motorista, km_inicial, observacao, origem)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (vtr_selecionada, data_digitada.strftime('%Y-%m-%d'), hora_digitada, turno_selecionado, cmt_digitado, mot_digitado, int(km_digitado), obs_digitada, dados_assuncao['origem']))
-        
-        cur.execute("""
-            INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, observacao, origem)
-            VALUES (?, ?, ?, ?, 0.0, ?, ?, ?)
-        """, (vtr_selecionada, data_digitada.strftime('%Y-%m-%d'), hora_digitada, int(km_digitado), mot_digitado, f"Assunção ({turno_selecionado}) - {obs_digitada}".strip(), dados_assuncao['origem']))
-
-        if obs_digitada.strip() and obs_digitada.lower() not in ['sem alteracao', 'sem alteração', 'ok', 'tudo ok']:
+    # Renderização do Botão de Confirmação com cor Verde quando registrado
+    if ja_gravou_ass:
+        st.markdown('<div class="btn-verde">', unsafe_allow_html=True)
+        st.button("✅ Assunção Registrada com Sucesso!", use_container_width=True, disabled=True, key="btn_confirmado_ass")
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        if st.button("💾 Confirmar e Homologar Assunção de Serviço", type="primary", use_container_width=True, key="btn_salvar_ass"):
+            conn = get_conexao()
+            cur = conn.cursor()
             cur.execute("""
-                INSERT INTO ocorrencias (prefixo, data, tipo, descricao, status, registrado_por)
-                VALUES (?, ?, 'Avaria / Assunção', ?, 'Pendente', ?)
-            """, (vtr_selecionada, data_digitada.strftime('%Y-%m-%d'), obs_digitada, mot_digitado or cmt_digitado))
+                INSERT INTO assuncoes_servico (prefixo, data, horario, turno, cmt_guarnicao, motorista, km_inicial, observacao, origem)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (vtr_sel, dt_sel.strftime('%Y-%m-%d'), hr_sel, turno_sel, cmt_sel, mot_sel, int(km_sel), obs_sel, dados_assuncao['origem']))
+            
+            id_nova_assuncao = cur.lastrowid
+            
+            # Sincroniza odômetro no histórico geral vinculando o assuncao_id
+            cur.execute("""
+                INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, observacao, origem, assuncao_id)
+                VALUES (?, ?, ?, ?, 0.0, ?, ?, ?, ?)
+            """, (vtr_sel, dt_sel.strftime('%Y-%m-%d'), hr_sel, int(km_sel), mot_sel, f"Assunção ({turno_sel}) - {obs_sel}".strip(), dados_assuncao['origem'], id_nova_assuncao))
 
-        conn.commit()
-        conn.close()
-        st.success(f"✅ Assunção de Serviço da VTR {vtr_selecionada} homologada com sucesso!")
-        if 'assuncao_ext' in st.session_state:
-            del st.session_state['assuncao_ext']
-        st.rerun()
+            if obs_sel.strip() and obs_sel.lower() not in ['sem alteracao', 'sem alteração', 'ok', 'tudo ok']:
+                cur.execute("""
+                    INSERT INTO ocorrencias (prefixo, data, tipo, descricao, status, registrado_por)
+                    VALUES (?, ?, 'Avaria / Assunção', ?, 'Pendente', ?)
+                """, (vtr_sel, dt_sel.strftime('%Y-%m-%d'), obs_sel, mot_sel or cmt_sel))
 
-# -----------------------------------------------------------------------------
-# 3. REGISTRO DE ABASTECIMENTO
-# -----------------------------------------------------------------------------
-with tab_abast:
+            conn.commit()
+            conn.close()
+            st.session_state["gravado_assuncao"] = True
+            st.session_state["ultima_vtr_ass"] = vtr_sel
+            if 'assuncao_ext' in st.session_state:
+                del st.session_state['assuncao_ext']
+            st.rerun()
+
+# =============================================================================
+# TELA 3: REGISTRO DE ABASTECIMENTO COM BOTÃO VERDE DE SUCESSO
+# =============================================================================
+elif st.session_state["tela_ativa"] == "⛽ Registrar Abastecimento":
     st.subheader("⛽ Registro de Abastecimento de Viaturas")
     st.caption("Cadastre os abastecimentos efetuados via Manual, Leitura de Foto da Bomba/Painel ou Mensagem do WhatsApp.")
 
+    ja_gravou_abast = st.session_state.get("gravado_abastecimento", False)
+    if ja_gravou_abast:
+        st.success(f"🎉 **Abastecimento Registrado com Sucesso!** VTR {st.session_state.get('ultima_vtr_abast')} homologada.")
+        if st.button("➕ Realizar Novo Abastecimento", key="btn_novo_abast"):
+            st.session_state["gravado_abastecimento"] = False
+            st.rerun()
+
     metodo_abast = st.radio(
-        "Método de Registro de Abastecimento:",
+        "Método de Entrada:",
         ["✍️ Manual", "📷 Leitura de Foto da Bomba / Painel", "💬 Texto do WhatsApp"],
-        horizontal=True,
-        key="radio_metodo_abast"
+        horizontal=True
     )
 
     dados_abast = {
@@ -554,13 +599,13 @@ with tab_abast:
     if metodo_abast == "💬 Texto do WhatsApp":
         txt_abast = st.text_area(
             "Cole a mensagem de abastecimento do WhatsApp:",
-            height=110,
-            placeholder="Exemplo:\nVTR: 1001\nKM: 42.150\nLitros: 55L\nMotorista: CB PM SOUZA\nObs: Posto Equador Djalma Batista"
+            height=100,
+            placeholder="Exemplo:\nVTR: 1001\nKM: 42.150\nLitros: 55L\nMotorista: CB PM SOUZA\nObs: Posto Equador"
         )
-        if st.button("🔍 Processar Mensagem Abastecimento", key="btn_proc_abast"):
+        if st.button("🔍 Processar Mensagem Abastecimento", key="btn_p_ab"):
             if txt_abast.strip():
                 st.session_state['abast_ext'] = extrair_dados_whatsapp(txt_abast)
-                st.success("Dados do abastecimento extraídos com sucesso!")
+                st.success("Dados identificados!")
 
         if 'abast_ext' in st.session_state:
             e = st.session_state['abast_ext']
@@ -576,63 +621,208 @@ with tab_abast:
     elif metodo_abast == "📷 Leitura de Foto da Bomba / Painel":
         col_f1, col_f2 = st.columns([1, 1])
         with col_f1:
-            foto_abast = st.file_uploader("Upload da foto da bomba ou odômetro:", type=['jpg', 'jpeg', 'png'], key="up_foto_abast")
-            foto_cam_abast = st.camera_input("Fotografar bomba ou odômetro:", key="cam_foto_abast")
-            
-            foto_usar_a = foto_cam_abast or foto_abast
-            if foto_usar_a:
-                km_detectado_a = extrair_km_imagem_ocr(foto_usar_a.getvalue())
-                if km_detectado_a > 0:
-                    dados_abast['km'] = km_detectado_a
-                    st.success(f"Odômetro detectado: {km_detectado_a:,} KM".replace(',', '.'))
+            foto_ab = st.file_uploader("Upload da foto da bomba ou odômetro:", type=['jpg', 'jpeg', 'png'], key="f_up_ab")
+            foto_cam_ab = st.camera_input("Fotografar:", key="f_cam_ab")
+            foto_u_ab = foto_cam_ab or foto_ab
+            if foto_u_ab:
+                km_det_ab = extrair_km_imagem_ocr(foto_u_ab.getvalue())
+                if km_det_ab > 0:
+                    dados_abast['km'] = km_det_ab
+                    st.success(f"Odômetro detectado: {km_det_ab:,} KM".replace(',', '.'))
                 dados_abast['origem'] = "FOTO_PAINEL"
         with col_f2:
-            if foto_usar_a:
-                st.image(foto_usar_a, caption="Comprovante / Foto do Abastecimento", use_container_width=True)
+            if foto_u_ab:
+                st.image(foto_u_ab, caption="Comprovante / Foto anexada", use_container_width=True)
 
-    with st.form("form_abastecimento"):
-        st.markdown("##### 📝 Formulário de Gravação de Abastecimento")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            idx_vtr = lista_prefixos.index(dados_abast['prefixo']) if dados_abast['prefixo'] in lista_prefixos else 0
-            vtr_sel = st.selectbox("Viatura:", lista_prefixos, index=idx_vtr, key="abast_vtr")
-            data_sel = st.date_input("Data do Abastecimento:", value=dados_abast['data'], key="abast_data")
-        with c2:
-            km_val = st.number_input("Odômetro (KM):", value=int(dados_abast['km']), step=1, key="abast_km")
-            litros_val = st.number_input("Litros Abastecidos:", value=float(dados_abast['litros']), step=0.1, format="%.2f", key="abast_lt")
-        with c3:
-            motorista_val = st.text_input("Motorista / Condutor:", value=dados_abast['motorista'], placeholder="Ex: CB PM ALMEIDA", key="abast_mot")
-            horario_val = st.text_input("Horário (Manaus):", value=dados_abast['horario'], key="abast_hr")
+    st.markdown("##### 📝 Formulário de Confirmação de Abastecimento")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        idx_vtr_b = lista_prefixos.index(dados_abast['prefixo']) if dados_abast['prefixo'] in lista_prefixos else 0
+        vtr_b = st.selectbox("Viatura:", lista_prefixos, index=idx_vtr_b, key="ab_vtr")
+        data_b = st.date_input("Data:", value=dados_abast['data'], key="ab_dt")
+    with c2:
+        km_b = st.number_input("Odômetro (KM):", value=int(dados_abast['km']), step=1, key="ab_km")
+        litros_b = st.number_input("Litros:", value=float(dados_abast['litros']), step=0.1, format="%.2f", key="ab_lt")
+    with c3:
+        mot_b = st.text_input("Motorista / Condutor:", value=dados_abast['motorista'], placeholder="Ex: CB PM ALMEIDA", key="ab_mot")
+        hr_b = st.text_input("Horário (Manaus):", value=dados_abast['horario'], key="ab_hr")
 
-        obs_val = st.text_input("Observação / Posto / Tipo de Combustível:", value=dados_abast['observacao'], key="abast_obs")
+    obs_b = st.text_input("Observação / Posto / Combustível:", value=dados_abast['observacao'], key="ab_obs")
 
-        if st.form_submit_button("💾 Salvar Registro de Abastecimento", type="primary", use_container_width=True):
+    # Botão com estilização verde quando gravado
+    if ja_gravou_abast:
+        st.markdown('<div class="btn-verde">', unsafe_allow_html=True)
+        st.button("✅ Abastecimento Registrado com Sucesso!", use_container_width=True, disabled=True, key="btn_confirmado_abast")
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        if st.button("💾 Salvar Registro de Abastecimento", type="primary", use_container_width=True, key="btn_salvar_abast_exec"):
             conn = get_conexao()
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO abastecimentos (prefixo, data, horario, km_atual, litros, motorista, observacao, origem)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (vtr_sel, data_sel.strftime('%Y-%m-%d'), horario_val, int(km_val), float(litros_val), motorista_val, obs_val, dados_abast['origem']))
+            """, (vtr_b, data_b.strftime('%Y-%m-%d'), hr_b, int(km_b), float(litros_b), mot_b, obs_b, dados_abast['origem']))
             
-            if any(p in obs_val.lower() for p in ['avaria', 'quebrado', 'pneu', 'furado', 'luz', 'farol', 'defeito']):
+            if any(p in obs_b.lower() for p in ['avaria', 'quebrado', 'pneu', 'furado', 'luz', 'farol', 'defeito']):
                 cur.execute("""
                     INSERT INTO ocorrencias (prefixo, data, tipo, descricao, status, registrado_por)
                     VALUES (?, ?, 'Avaria / Abastecimento', ?, 'Pendente', ?)
-                """, (vtr_sel, data_sel.strftime('%Y-%m-%d'), obs_val, motorista_val))
+                """, (vtr_b, data_b.strftime('%Y-%m-%d'), obs_b, mot_b))
 
             conn.commit()
             conn.close()
-            st.success(f"✅ Abastecimento da VTR {vtr_sel} gravado com sucesso!")
+            st.session_state["gravado_abastecimento"] = True
+            st.session_state["ultima_vtr_abast"] = vtr_b
             if 'abast_ext' in st.session_state:
                 del st.session_state['abast_ext']
             st.rerun()
 
-# -----------------------------------------------------------------------------
-# 4. REGISTRO DE REVISÃO REALIZADA
-# -----------------------------------------------------------------------------
-with tab_reg_rev:
+# =============================================================================
+# TELA 4: CORREÇÃO E EXCLUSÃO DE LANÇAMENTOS (LIMPA TOTALMENTE DO HISTÓRICO)
+# =============================================================================
+elif st.session_state["tela_ativa"] == "✏️ Corrigir / Editar Lançamentos":
+    st.subheader("✏️ Módulo de Correção e Exclusão de Registros")
+    st.caption("Ao corrigir ou excluir um registro, ele é imediatamente atualizado ou removido do histórico oficial.")
+
+    tipo_correcao = st.radio(
+        "Qual lançamento deseja corrigir ou excluir?",
+        ["⛽ Abastecimento", "🛡️ Assunção de Serviço"],
+        horizontal=True
+    )
+
+    conn = get_conexao()
+    
+    if tipo_correcao == "⛽ Abastecimento":
+        df_ab = pd.read_sql_query("SELECT id, prefixo, data, horario, km_atual, litros, motorista, observacao FROM abastecimentos WHERE litros > 0 OR origem != 'MANUAL' ORDER BY id DESC LIMIT 50", conn)
+        
+        if df_ab.empty:
+            st.info("Nenhum lançamento de abastecimento localizado para edição.")
+        else:
+            opcoes_ab = {
+                f"ID #{row['id']} | VTR {row['prefixo']} | Data {row['data']} {row['horario']} | {row['km_atual']} KM | {row['litros']}L | {row['motorista']}": row['id']
+                for _, row in df_ab.iterrows()
+            }
+            sel_ab_texto = st.selectbox("Selecione o abastecimento a corrigir:", list(opcoes_ab.keys()))
+            id_sel_ab = opcoes_ab[sel_ab_texto]
+            
+            registro_ab = df_ab[df_ab['id'] == id_sel_ab].iloc[0]
+
+            with st.form("form_edita_abast"):
+                st.markdown(f"#### Editando Abastecimento (ID #{id_sel_ab})")
+                col_e1, col_e2, col_e3 = st.columns(3)
+                with col_e1:
+                    novo_vtr_ab = st.selectbox("Viatura:", lista_prefixos, index=lista_prefixos.index(registro_ab['prefixo']) if registro_ab['prefixo'] in lista_prefixos else 0)
+                    nova_data_ab = st.date_input("Data:", value=pd.to_datetime(registro_ab['data']).date())
+                with col_e2:
+                    novo_km_ab = st.number_input("KM Atual:", value=int(registro_ab['km_atual']), step=1)
+                    novos_litros_ab = st.number_input("Litros:", value=float(registro_ab['litros']), step=0.1, format="%.2f")
+                with col_e3:
+                    novo_mot_ab = st.text_input("Motorista:", value=registro_ab['motorista'] or "")
+                    novo_hr_ab = st.text_input("Horário:", value=registro_ab['horario'] or "")
+
+                nova_obs_ab = st.text_input("Observação:", value=registro_ab['observacao'] or "")
+
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    salvar_edicao_ab = st.form_submit_button("💾 Salvar Correções no Registro", type="primary", use_container_width=True)
+                with col_btn2:
+                    excluir_ab = st.form_submit_button("🗑️ Excluir Definitivamente do Histórico", use_container_width=True)
+
+                if salvar_edicao_ab:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE abastecimentos 
+                        SET prefixo = ?, data = ?, horario = ?, km_atual = ?, litros = ?, motorista = ?, observacao = ?
+                        WHERE id = ?
+                    """, (novo_vtr_ab, nova_data_ab.strftime('%Y-%m-%d'), novo_hr_ab, int(novo_km_ab), float(novos_litros_ab), novo_mot_ab, nova_obs_ab, id_sel_ab))
+                    conn.commit()
+                    st.success(f"Registro #{id_sel_ab} corrigido com sucesso!")
+                    st.rerun()
+
+                if excluir_ab:
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM abastecimentos WHERE id = ?", (id_sel_ab,))
+                    conn.commit()
+                    st.warning(f"Registro #{id_sel_ab} excluído e removido do histórico!")
+                    st.rerun()
+
+    else:
+        df_as = pd.read_sql_query("SELECT id, prefixo, data, horario, turno, cmt_guarnicao, motorista, km_inicial, observacao FROM assuncoes_servico ORDER BY id DESC LIMIT 50", conn)
+        
+        if df_as.empty:
+            st.info("Nenhuma assunção de serviço localizada para edição.")
+        else:
+            opcoes_as = {
+                f"ID #{row['id']} | VTR {row['prefixo']} | Data {row['data']} {row['horario']} | {row['turno']} | {row['km_inicial']} KM | Cmt: {row['cmt_guarnicao']}": row['id']
+                for _, row in df_as.iterrows()
+            }
+            sel_as_texto = st.selectbox("Selecione a assunção de serviço a corrigir:", list(opcoes_as.keys()))
+            id_sel_as = opcoes_as[sel_as_texto]
+            
+            registro_as = df_as[df_as['id'] == id_sel_as].iloc[0]
+
+            with st.form("form_edita_assuncao"):
+                st.markdown(f"#### Editando Assunção de Serviço (ID #{id_sel_as})")
+                col_s1, col_s2, col_s3 = st.columns(3)
+                with col_s1:
+                    novo_vtr_as = st.selectbox("Viatura:", lista_prefixos, index=lista_prefixos.index(registro_as['prefixo']) if registro_as['prefixo'] in lista_prefixos else 0)
+                    nova_data_as = st.date_input("Data:", value=pd.to_datetime(registro_as['data']).date())
+                with col_s2:
+                    novo_km_as = st.number_input("KM Inicial:", value=int(registro_as['km_inicial']), step=1)
+                    turnos_disp = ["1º Turno (07h às 19h)", "2º Turno (19h às 07h)", "Turno Extra / Operação Especial"]
+                    idx_trn = turnos_disp.index(registro_as['turno']) if registro_as['turno'] in turnos_disp else 0
+                    novo_turno_as = st.selectbox("Turno:", turnos_disp, index=idx_trn)
+                with col_s3:
+                    novo_cmt_as = st.text_input("Comandante Guarnição:", value=registro_as['cmt_guarnicao'] or "")
+                    novo_hr_as = st.text_input("Horário:", value=registro_as['horario'] or "")
+
+                novo_mot_as = st.text_input("Motorista:", value=registro_as['motorista'] or "")
+                nova_obs_as = st.text_area("Observações / Avarias na Assunção:", value=registro_as['observacao'] or "")
+
+                col_btn_s1, col_btn_s2 = st.columns(2)
+                with col_btn_s1:
+                    salvar_edicao_as = st.form_submit_button("💾 Salvar Correções na Assunção", type="primary", use_container_width=True)
+                with col_btn_s2:
+                    excluir_as = st.form_submit_button("🗑️ Excluir Definitivamente do Histórico", use_container_width=True)
+
+                if salvar_edicao_as:
+                    cur = conn.cursor()
+                    # Atualiza tabela de assunções
+                    cur.execute("""
+                        UPDATE assuncoes_servico 
+                        SET prefixo = ?, data = ?, horario = ?, turno = ?, cmt_guarnicao = ?, motorista = ?, km_inicial = ?, observacao = ?
+                        WHERE id = ?
+                    """, (novo_vtr_as, nova_data_as.strftime('%Y-%m-%d'), novo_hr_as, novo_turno_as, novo_cmt_as, novo_mot_as, int(novo_km_as), nova_obs_as, id_sel_as))
+                    
+                    # Sincroniza o espelho do odômetro no histórico geral de abastecimentos
+                    cur.execute("""
+                        UPDATE abastecimentos
+                        SET prefixo = ?, data = ?, horario = ?, km_atual = ?, motorista = ?, observacao = ?
+                        WHERE assuncao_id = ?
+                    """, (novo_vtr_as, nova_data_as.strftime('%Y-%m-%d'), novo_hr_as, int(novo_km_as), novo_mot_as, f"Assunção ({novo_turno_as}) - {nova_obs_as}".strip(), id_sel_as))
+                    
+                    conn.commit()
+                    st.success(f"Assunção #{id_sel_as} e histórico sincronizados com sucesso!")
+                    st.rerun()
+
+                if excluir_as:
+                    cur = conn.cursor()
+                    # Remove da tabela de assunção
+                    cur.execute("DELETE FROM assuncoes_servico WHERE id = ?", (id_sel_as,))
+                    # Remove o espelho da assunção da tabela de abastecimentos/histórico
+                    cur.execute("DELETE FROM abastecimentos WHERE assuncao_id = ?", (id_sel_as,))
+                    conn.commit()
+                    st.warning(f"Assunção #{id_sel_as} removida completamente do histórico!")
+                    st.rerun()
+
+    conn.close()
+
+# =============================================================================
+# TELA 5: REGISTRO DE REVISÃO REALIZADA
+# =============================================================================
+elif st.session_state["tela_ativa"] == "🛠️ Registrar Revisão Realizada":
     st.subheader("🛠️ Registrar Revisão Mecânica Realizada")
-    st.caption("Use esta área para homologar a revisão preventiva feita na concessionária ou oficina conveniada. A quilometragem base da viatura será atualizada automaticamente.")
+    st.caption("Use esta área para homologar a revisão preventiva feita na concessionária ou oficina conveniada. A base da viatura será atualizada automaticamente.")
 
     with st.form("form_revisao_feita", clear_on_submit=True):
         c_r1, c_r2, c_r3 = st.columns(3)
@@ -647,18 +837,17 @@ with tab_reg_rev:
             ])
         with c_r2:
             rev_data = st.date_input("Data da Realização da Revisão:", value=agora_manaus().date())
-            rev_km = st.number_input("Odômetro da Viatura na Revisão (KM):", min_value=0, step=1000, help="Esta quilometragem se tornará a nova base para calcular a próxima revisão.")
+            rev_km = st.number_input("Odômetro da Viatura na Revisão (KM):", min_value=0, step=1000)
         with c_r3:
-            rev_oficina = st.text_input("Oficina / Concessionária:", placeholder="Ex: Pedragon Chevrolet / Oficina PMAM")
-            rev_resp = st.text_input("Policial Responsável pela Entrega / Recebimento:", placeholder="Ex: SGT PM MOURA (Armeiro/Transporte)")
+            rev_oficina = st.text_input("Oficina / Concessionária:", placeholder="Ex: Concessionária Chevrolet / Oficina PMAM")
+            rev_resp = st.text_input("Policial Responsável pelo Recebimento:", placeholder="Ex: SGT PM MOURA")
 
-        rev_obs = st.text_area("Serviços Executados e Peças Trocadas (OS):", placeholder="Ex: Troca de óleo do motor, filtro de óleo, filtro de combustível, pastilhas de freio dianteiras e alinhamento.")
+        rev_obs = st.text_area("Serviços Executados e Peças Trocadas (OS):", placeholder="Ex: Troca de óleo, pastilhas de freio e filtros.")
 
-        if st.form_submit_button("✅ Homologar e Gravar Revisão no Sistema", type="primary", use_container_width=True):
+        if st.form_submit_button("✅ Homologar e Gravar Revisão", type="primary", use_container_width=True):
             if rev_km > 0:
                 conn = get_conexao()
                 cur = conn.cursor()
-                
                 cur.execute("""
                     INSERT INTO historico_revisoes (prefixo, data, km_revisao, tipo_revisao, oficina, responsavel, observacoes)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -672,27 +861,26 @@ with tab_reg_rev:
                 
                 conn.commit()
                 conn.close()
-                st.success(f"🎉 Revisão da VTR {rev_vtr} homologada com sucesso! Base recalibrada para {rev_km:,} KM.")
+                st.success(f"🎉 Revisão da VTR {rev_vtr} homologada com sucesso! Base atualizada para {rev_km:,} KM.")
                 st.rerun()
             else:
-                st.warning("Informe o odômetro exato da realização da revisão para atualizar a base da viatura.")
+                st.warning("Informe o odômetro exato da revisão.")
 
     st.write("---")
-    st.markdown("##### 📋 Histórico de Revisões Realizadas na 10ª CICOM")
+    st.markdown("##### 📋 Histórico de Revisões Cadastradas")
     df_rev_historico = obter_historico_revisoes(filtro_vtr)
     if df_rev_historico.empty:
-        st.info("Nenhuma revisão homologada cadastrada até o momento.")
+        st.info("Nenhuma revisão homologada cadastrada.")
     else:
         st.dataframe(df_rev_historico, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# 5. AVARIAS & OCORRÊNCIAS
-# -----------------------------------------------------------------------------
-with tab_avarias:
+# =============================================================================
+# TELA 6: AVARIAS & OCORRÊNCIAS
+# =============================================================================
+elif st.session_state["tela_ativa"] == "⚠️ Avarias & Ocorrências":
     st.subheader("⚠️ Controle de Avarias e Ocorrências das Viaturas")
     
     col_cad, col_lista = st.columns([1, 1.6])
-    
     with col_cad:
         st.markdown("#### 📝 Registrar Nova Avaria")
         with st.form("form_avaria", clear_on_submit=True):
@@ -707,8 +895,8 @@ with tab_avarias:
                 "Documentação / Cartão",
                 "Outros"
             ])
-            av_desc = st.text_area("Descrição do Problema:", placeholder="Ex: Pneu dianteiro direito furado ou farol queimado.")
-            av_policial = st.text_input("Policial / Condutor Relatante:", placeholder="Ex: SGT PM CARDOSO")
+            av_desc = st.text_area("Descrição do Problema:", placeholder="Ex: Pneu dianteiro esquerdo furado.")
+            av_policial = st.text_input("Policial Relatante:", placeholder="Ex: SGT PM CARDOSO")
             
             if st.form_submit_button("🚨 Salvar Registro de Avaria", use_container_width=True):
                 if av_desc.strip():
@@ -720,7 +908,7 @@ with tab_avarias:
                     """, (av_vtr, av_data.strftime('%Y-%m-%d'), av_tipo, av_desc.strip(), av_policial.strip()))
                     conn.commit()
                     conn.close()
-                    st.success(f"Avaria da VTR {av_vtr} registrada com sucesso!")
+                    st.success(f"Avaria da VTR {av_vtr} registrada!")
                     st.rerun()
                 else:
                     st.warning("Descreva o problema antes de salvar.")
@@ -748,50 +936,48 @@ with tab_avarias:
                             cur.execute("UPDATE ocorrencias SET status = 'Solucionado' WHERE id = ?", (id_oc,))
                             conn.commit()
                             conn.close()
-                            st.success("Ocorrência atualizada para SOLUCIONADO!")
+                            st.success("Ocorrência marcada como solucionada!")
                             st.rerun()
 
-# -----------------------------------------------------------------------------
-# 6. HISTÓRICO COMPLETO (ABASTECIMENTOS, ASSUNÇÕES E REVISÕES)
-# -----------------------------------------------------------------------------
-with tab_hist:
+# =============================================================================
+# TELA 7: HISTÓRICO COMPLETO
+# =============================================================================
+elif st.session_state["tela_ativa"] == "📑 Histórico Completo":
     st.subheader(f"Histórico Geral da Frota ({filtro_vtr})")
     
-    sub_tab1, sub_tab2, sub_tab3 = st.tabs(["⛽ Abastecimentos", "🛡️ Assunções de Serviço", "🛠️ Revisões"])
+    sub1, sub2, sub3 = st.tabs(["⛽ Abastecimentos", "🛡️ Assunções de Serviço", "🛠️ Revisões"])
     
-    with sub_tab1:
-        df_filtrado_abast = obter_historico_abastecimentos(filtro_vtr)
-        st.dataframe(df_filtrado_abast, use_container_width=True)
-        buffer1 = io.BytesIO()
-        with pd.ExcelWriter(buffer1, engine='openpyxl') as writer:
-            df_filtrado_abast.to_excel(writer, index=False, sheet_name='Abastecimentos')
-        st.download_button("📥 Baixar Abastecimentos (.xlsx)", data=buffer1.getvalue(), file_name="abastecimentos_10cicom.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with sub1:
+        df_f_ab = obter_historico_abastecimentos(filtro_vtr)
+        st.dataframe(df_f_ab.drop(columns=['assuncao_id'], errors='ignore'), use_container_width=True)
+        buf1 = io.BytesIO()
+        with pd.ExcelWriter(buf1, engine='openpyxl') as writer:
+            df_f_ab.to_excel(writer, index=False, sheet_name='Abastecimentos')
+        st.download_button("📥 Baixar Abastecimentos (.xlsx)", data=buf1.getvalue(), file_name="abastecimentos_10cicom.xlsx")
 
-    with sub_tab2:
-        df_filtrado_assuncao = obter_historico_assuncoes(filtro_vtr)
-        st.dataframe(df_filtrado_assuncao, use_container_width=True)
-        buffer2 = io.BytesIO()
-        with pd.ExcelWriter(buffer2, engine='openpyxl') as writer:
-            df_filtrado_assuncao.to_excel(writer, index=False, sheet_name='Assuncoes')
-        st.download_button("📥 Baixar Assunções (.xlsx)", data=buffer2.getvalue(), file_name="assuncoes_10cicom.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with sub2:
+        df_f_as = obter_historico_assuncoes(filtro_vtr)
+        st.dataframe(df_f_as, use_container_width=True)
+        buf2 = io.BytesIO()
+        with pd.ExcelWriter(buf2, engine='openpyxl') as writer:
+            df_f_as.to_excel(writer, index=False, sheet_name='Assuncoes')
+        st.download_button("📥 Baixar Assunções (.xlsx)", data=buf2.getvalue(), file_name="assuncoes_10cicom.xlsx")
 
-    with sub_tab3:
-        df_filtrado_rev = obter_historico_revisoes(filtro_vtr)
-        st.dataframe(df_filtrado_rev, use_container_width=True)
-        buffer3 = io.BytesIO()
-        with pd.ExcelWriter(buffer3, engine='openpyxl') as writer:
-            df_filtrado_rev.to_excel(writer, index=False, sheet_name='Revisoes')
-        st.download_button("📥 Baixar Revisões (.xlsx)", data=buffer3.getvalue(), file_name="revisoes_10cicom.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with sub3:
+        df_f_rv = obter_historico_revisoes(filtro_vtr)
+        st.dataframe(df_f_rv, use_container_width=True)
+        buf3 = io.BytesIO()
+        with pd.ExcelWriter(buf3, engine='openpyxl') as writer:
+            df_f_rv.to_excel(writer, index=False, sheet_name='Revisoes')
+        st.download_button("📥 Baixar Revisões (.xlsx)", data=buf3.getvalue(), file_name="revisoes_10cicom.xlsx")
 
-# -----------------------------------------------------------------------------
-# 7. QUADRO GERAL DE REVISÕES PREVENTIVAS
-# -----------------------------------------------------------------------------
-with tab_manut:
+# =============================================================================
+# TELA 8: QUADRO GERAL DE REVISÕES
+# =============================================================================
+elif st.session_state["tela_ativa"] == "🔍 Monitor de Revisões":
     st.subheader('🔍 Quadro Geral de Monitoramento das Revisões (Intervalo: 10.000 KM)')
 
-    df_vtrs = obter_viaturas()
     df_todos = obter_historico_abastecimentos()
-
     lista_m = []
     for _, vtr in df_vtrs.iterrows():
         p = vtr['prefixo']
@@ -819,11 +1005,11 @@ with tab_manut:
     with st.form('form_ajuste_revisao_manual'):
         col_v, col_base, col_int = st.columns(3)
         with col_v:
-            vtr_escolhida = st.selectbox('Selecione a Viatura:', lista_prefixos, key="calib_vtr")
+            vtr_esc = st.selectbox('Selecione a Viatura:', lista_prefixos, key="cal_vtr")
         with col_base:
-            km_base_novo = st.number_input('KM Base da Última Revisão:', min_value=0, step=1000, value=0, key="calib_base")
+            km_b_nov = st.number_input('KM Base da Última Revisão:', min_value=0, step=1000, value=0, key="cal_b")
         with col_int:
-            int_novo = st.number_input('Intervalo de Manutenção (Padrão: 10.000):', min_value=1000, step=1000, value=10000, key="calib_int")
+            int_nov = st.number_input('Intervalo de Manutenção (Padrão: 10.000):', min_value=1000, step=1000, value=10000, key="cal_i")
 
         if st.form_submit_button('💾 Gravar Novos Parâmetros', use_container_width=True):
             conn_up = get_conexao()
@@ -832,9 +1018,9 @@ with tab_manut:
                 UPDATE viaturas 
                 SET km_revisao_base = ?, intervalo_revisao = ?
                 WHERE prefixo = ?
-            """, (int(km_base_novo), int(int_novo), vtr_escolhida))
+            """, (int(km_b_nov), int(int_nov), vtr_esc))
             conn_up.commit()
             conn_up.close()
-            st.success(f'✅ Parâmetros da VTR {vtr_escolhida} calibrados com sucesso!')
+            st.success(f'✅ Parâmetros da VTR {vtr_esc} calibrados com sucesso!')
             st.rerun()
             
