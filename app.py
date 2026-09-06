@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import io
+import numpy as np
 from PIL import Image
 
 # -----------------------------------------------------------------------------
@@ -19,7 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Injeção de CSS para estilizar botões verdes de sucesso
 st.markdown("""
     <style>
     div[data-testid="stButton"] button[kind="primary"] {
@@ -42,6 +42,65 @@ def agora_manaus():
 NOME_BANCO = "frota_10cicom.db"
 ARQUIVO_EXCEL = "kms_abastecimento_10cicom.xlsx"
 SENHA_PADRAO = "10cicom"
+
+# -----------------------------------------------------------------------------
+# MOTOR DE OCR (EASYOCR COM CACHE RESOURCE)
+# -----------------------------------------------------------------------------
+@st.cache_resource
+def carregar_leitor_ocr():
+    try:
+        import easyocr
+        return easyocr.Reader(['pt', 'en'], gpu=False)
+    except Exception:
+        return None
+
+def extrair_texto_imagem(imagem_bytes):
+    """Lê todas as linhas de texto de um print ou foto do WhatsApp."""
+    reader = carregar_leitor_ocr()
+    if reader is not None:
+        try:
+            img = Image.open(io.BytesIO(imagem_bytes)).convert("RGB")
+            img_np = np.array(img)
+            linhas = reader.readtext(img_np, detail=0)
+            return "\n".join(linhas)
+        except Exception:
+            pass
+
+    # Fallback caso use pytesseract
+    try:
+        import pytesseract
+        img = Image.open(io.BytesIO(imagem_bytes))
+        return pytesseract.image_to_string(img, lang="por")
+    except Exception:
+        pass
+
+    return ""
+
+def extrair_km_painel_ocr(imagem_bytes):
+    """Extrai odômetro numérico de fotos do painel do carro."""
+    reader = carregar_leitor_ocr()
+    if reader is not None:
+        try:
+            img = Image.open(io.BytesIO(imagem_bytes)).convert("RGB")
+            img_np = np.array(img)
+            textos = reader.readtext(img_np, detail=0)
+            for t in textos:
+                nums = re.findall(r'\b\d{4,6}\b', t.replace('.', '').replace(',', ''))
+                if nums:
+                    return int(nums[0])
+        except Exception:
+            pass
+
+    try:
+        import pytesseract
+        img = Image.open(io.BytesIO(imagem_bytes))
+        texto_ocr = pytesseract.image_to_string(img, config='--psm 6 digits')
+        numeros = re.findall(r'\b\d{4,6}\b', texto_ocr)
+        if numeros:
+            return int(numeros[0])
+    except Exception:
+        pass
+    return 0
 
 # -----------------------------------------------------------------------------
 # AUTENTICAÇÃO POR SENHA (10cicom)
@@ -84,7 +143,6 @@ def inicializar_banco():
     conn = get_conexao()
     cursor = conn.cursor()
     
-    # 1. Tabela de Viaturas
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS viaturas (
             prefixo TEXT PRIMARY KEY,
@@ -97,7 +155,6 @@ def inicializar_banco():
         )
     """)
     
-    # 2. Tabela de Abastecimentos / Odômetro Geral
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS abastecimentos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +172,6 @@ def inicializar_banco():
         )
     """)
 
-    # 3. Tabela de Assunções de Serviço
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS assuncoes_servico (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +188,6 @@ def inicializar_banco():
         )
     """)
 
-    # 4. Tabela de Avarias e Ocorrências
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ocorrencias (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +201,6 @@ def inicializar_banco():
         )
     """)
 
-    # 5. Tabela de Histórico de Revisões Realizadas
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS historico_revisoes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,7 +240,7 @@ def inicializar_banco():
 inicializar_banco()
 
 # -----------------------------------------------------------------------------
-# REGRAS DE CÁLCULO DE REVISÃO PREVENTIVA
+# CÁLCULO DE REVISÃO PREVENTIVA
 # -----------------------------------------------------------------------------
 def calcular_status_revisao(km_atual, km_base, intervalo=10000):
     if intervalo <= 0:
@@ -216,7 +270,7 @@ def calcular_status_revisao(km_atual, km_base, intervalo=10000):
     return prox, restante, status, classe
 
 # -----------------------------------------------------------------------------
-# PARSERS DE TEXTO E FOTO
+# PARSER ROBUSTO DE DADOS
 # -----------------------------------------------------------------------------
 def extrair_dados_whatsapp(texto):
     dados = {
@@ -242,7 +296,7 @@ def extrair_dados_whatsapp(texto):
                 dados["prefixo"] = f"25-{p}"
                 break
                 
-    # 2. Odômetro / KM
+    # 2. Odômetro
     km_match = re.search(r'(?:KM|ODOMETRO|QUILOMETRAGEM)[:\s]*([0-9\.\,]+)', texto, re.IGNORECASE)
     if km_match:
         km_clean = km_match.group(1).replace('.', '').replace(',', '')
@@ -254,7 +308,7 @@ def extrair_dados_whatsapp(texto):
     if l_match:
         try:
             dados["litros"] = float(l_match.group(1).replace(',', '.'))
-        except:
+        except Exception:
             pass
             
     # 4. Motorista
@@ -289,18 +343,6 @@ def extrair_dados_whatsapp(texto):
         dados["observacao"] = obs_match.group(1).strip()
         
     return dados
-
-def extrair_km_imagem_ocr(imagem_bytes):
-    try:
-        import pytesseract
-        img = Image.open(io.BytesIO(imagem_bytes))
-        texto_ocr = pytesseract.image_to_string(img, config='--psm 6 digits')
-        numeros = re.findall(r'\b\d{4,6}\b', texto_ocr)
-        if numeros:
-            return int(numeros[0])
-    except:
-        pass
-    return 0
 
 # -----------------------------------------------------------------------------
 # CONSULTAS AUXILIARES
@@ -359,49 +401,51 @@ df_vtrs = obter_viaturas()
 lista_prefixos = df_vtrs['prefixo'].tolist()
 
 # -----------------------------------------------------------------------------
-# FUNÇÕES DE CALLBACK PARA PREENCHIMENTO AUTOMÁTICO VIA WHATSAPP
+# FUNÇÕES DE INJEÇÃO DIRETA NOS CAMPOS
 # -----------------------------------------------------------------------------
+def aplicar_dados_assuncao(dados, origem):
+    if dados["prefixo"] and dados["prefixo"] in lista_prefixos:
+        st.session_state["as_vtr"] = dados["prefixo"]
+    if dados["km"] > 0:
+        st.session_state["as_km"] = int(dados["km"])
+    if dados["motorista"]:
+        st.session_state["as_mot"] = dados["motorista"]
+    if dados["cmt_guarnicao"]:
+        st.session_state["as_cmt"] = dados["cmt_guarnicao"]
+    if dados["horario"]:
+        st.session_state["as_hr"] = dados["horario"]
+    if dados["observacao"]:
+        st.session_state["as_obs"] = dados["observacao"]
+    if dados["turno"] in ["1º Turno (07h às 19h)", "2º Turno (19h às 07h)", "Turno Extra / Operação Especial"]:
+        st.session_state["as_trn"] = dados["turno"]
+    st.session_state["origem_assuncao"] = origem
+
+def aplicar_dados_abastecimento(dados, origem):
+    if dados["prefixo"] and dados["prefixo"] in lista_prefixos:
+        st.session_state["ab_vtr"] = dados["prefixo"]
+    if dados["km"] > 0:
+        st.session_state["ab_km"] = int(dados["km"])
+    if dados["litros"] > 0:
+        st.session_state["ab_lt"] = float(dados["litros"])
+    if dados["motorista"]:
+        st.session_state["ab_mot"] = dados["motorista"]
+    if dados["horario"]:
+        st.session_state["ab_hr"] = dados["horario"]
+    if dados["observacao"]:
+        st.session_state["ab_obs"] = dados["observacao"]
+    st.session_state["origem_abastecimento"] = origem
+
 def preencher_automatico_assuncao():
     texto = st.session_state.get("campo_txt_zap_assuncao", "")
     if texto.strip():
-        dados = extrair_dados_whatsapp(texto)
-        if dados["prefixo"] and dados["prefixo"] in lista_prefixos:
-            st.session_state["as_vtr"] = dados["prefixo"]
-        if dados["km"] > 0:
-            st.session_state["as_km"] = int(dados["km"])
-        if dados["motorista"]:
-            st.session_state["as_mot"] = dados["motorista"]
-        if dados["cmt_guarnicao"]:
-            st.session_state["as_cmt"] = dados["cmt_guarnicao"]
-        if dados["horario"]:
-            st.session_state["as_hr"] = dados["horario"]
-        if dados["observacao"]:
-            st.session_state["as_obs"] = dados["observacao"]
-        if dados["turno"] in ["1º Turno (07h às 19h)", "2º Turno (19h às 07h)", "Turno Extra / Operação Especial"]:
-            st.session_state["as_trn"] = dados["turno"]
-        st.session_state["origem_assuncao"] = "WHATSAPP"
+        aplicar_dados_assuncao(extrair_dados_whatsapp(texto), "WHATSAPP_TEXTO")
 
 def preencher_automatico_abastecimento():
     texto = st.session_state.get("campo_txt_zap_abast", "")
     if texto.strip():
-        dados = extrair_dados_whatsapp(texto)
-        if dados["prefixo"] and dados["prefixo"] in lista_prefixos:
-            st.session_state["ab_vtr"] = dados["prefixo"]
-        if dados["km"] > 0:
-            st.session_state["ab_km"] = int(dados["km"])
-        if dados["litros"] > 0:
-            st.session_state["ab_lt"] = float(dados["litros"])
-        if dados["motorista"]:
-            st.session_state["ab_mot"] = dados["motorista"]
-        if dados["horario"]:
-            st.session_state["ab_hr"] = dados["horario"]
-        if dados["observacao"]:
-            st.session_state["ab_obs"] = dados["observacao"]
-        st.session_state["origem_abastecimento"] = "WHATSAPP"
+        aplicar_dados_abastecimento(extrair_dados_whatsapp(texto), "WHATSAPP_TEXTO")
 
-# -----------------------------------------------------------------------------
-# INICIALIZAÇÃO SEGURA DO ESTADO DOS CAMPOS
-# -----------------------------------------------------------------------------
+# Inicialização de estado dos formulários
 if "as_vtr" not in st.session_state:
     st.session_state["as_vtr"] = lista_prefixos[0] if lista_prefixos else ""
 if "as_km" not in st.session_state:
@@ -435,7 +479,7 @@ if "origem_abastecimento" not in st.session_state:
     st.session_state["origem_abastecimento"] = "MANUAL"
 
 # -----------------------------------------------------------------------------
-# BARRA LATERAL (MENU OPERACIONAL COM BOTÕES NA LATERAL ESQUERDA)
+# BARRA LATERAL (MENU OPERACIONAL)
 # -----------------------------------------------------------------------------
 if "tela_ativa" not in st.session_state:
     st.session_state["tela_ativa"] = "📊 Visão Geral & Odômetros"
@@ -513,11 +557,11 @@ if st.session_state["tela_ativa"] == "📊 Visão Geral & Odômetros":
         st.dataframe(df_todos_abast[df_todos_abast['litros'] > 0].head(6), use_container_width=True)
 
 # =============================================================================
-# TELA 2: ASSUNÇÃO DE SERVIÇO COM PREENCHIMENTO AUTOMÁTICO IMEDIATO
+# TELA 2: ASSUNÇÃO DE SERVIÇO COM LEITURA DE PRINT E BOTÃO VERDE
 # =============================================================================
 elif st.session_state["tela_ativa"] == "🛡️ Assunção de Serviço":
     st.subheader("🛡️ Registro de Assunção de Serviço da Viatura")
-    st.caption("Cadastre a entrada de serviço. Ao colar o texto do WhatsApp, os campos abaixo são preenchidos automaticamente.")
+    st.caption("Você pode colar o texto, anexar o print da mensagem do WhatsApp ou a foto do painel. Os campos são preenchidos automaticamente.")
 
     ja_gravou_ass = st.session_state.get("gravado_assuncao", False)
     if ja_gravou_ass:
@@ -532,11 +576,16 @@ elif st.session_state["tela_ativa"] == "🛡️ Assunção de Serviço":
 
     metodo_assuncao = st.radio(
         "Modo de Entrada:",
-        ["💬 Texto do WhatsApp (Preenchimento Automático)", "📷 Leitura de Foto do Painel", "✍️ Digitação Manual"],
+        [
+            "💬 Texto do WhatsApp (Copiar/Colar)",
+            "📱 Print / Imagem da Mensagem do WhatsApp (OCR)",
+            "📷 Foto do Painel do Carro (Odômetro)",
+            "✍️ Digitação Manual"
+        ],
         horizontal=True
     )
 
-    if metodo_assuncao == "💬 Texto do WhatsApp (Preenchimento Automático)":
+    if metodo_assuncao == "💬 Texto do WhatsApp (Copiar/Colar)":
         st.text_area(
             "Cole a mensagem padrão de assunção do WhatsApp aqui:",
             key="campo_txt_zap_assuncao",
@@ -547,14 +596,31 @@ elif st.session_state["tela_ativa"] == "🛡️ Assunção de Serviço":
         if st.session_state.get("campo_txt_zap_assuncao", "").strip():
             preencher_automatico_assuncao()
 
-    elif metodo_assuncao == "📷 Leitura de Foto do Painel":
+    elif metodo_assuncao == "📱 Print / Imagem da Mensagem do WhatsApp (OCR)":
+        col_img1, col_img2 = st.columns([1, 1])
+        with col_img1:
+            print_zap_ass = st.file_uploader("Upload do Print da Conversa do WhatsApp:", type=['jpg', 'jpeg', 'png'], key="up_print_ass")
+            if print_zap_ass:
+                with st.spinner("🤖 Lendo imagem do WhatsApp com OCR..."):
+                    texto_extraido = extrair_texto_imagem(print_zap_ass.getvalue())
+                    if texto_extraido:
+                        dados = extrair_dados_whatsapp(texto_extraido)
+                        aplicar_dados_assuncao(dados, "PRINT_WHATSAPP")
+                        st.success("✅ Texto da imagem lido e campos preenchidos!")
+                    else:
+                        st.warning("Não foi possível identificar o texto na imagem.")
+        with col_img2:
+            if print_zap_ass:
+                st.image(print_zap_ass, caption="Print do WhatsApp anexado", use_container_width=True)
+
+    elif metodo_assuncao == "📷 Foto do Painel do Carro (Odômetro)":
         c_p1, c_p2 = st.columns([1, 1])
         with c_p1:
             foto_ass = st.file_uploader("Upload da foto do painel/odômetro:", type=['jpg', 'jpeg', 'png'], key="f_up_ass")
             foto_cam_ass = st.camera_input("Fotografar odômetro:", key="f_cam_ass")
             foto_u_ass = foto_cam_ass or foto_ass
             if foto_u_ass:
-                km_det = extrair_km_imagem_ocr(foto_u_ass.getvalue())
+                km_det = extrair_km_painel_ocr(foto_u_ass.getvalue())
                 if km_det > 0:
                     st.session_state["as_km"] = km_det
                     st.success(f"Odômetro detectado: {km_det:,} KM".replace(',', '.'))
@@ -583,7 +649,6 @@ elif st.session_state["tela_ativa"] == "🛡️ Assunção de Serviço":
     mot_sel = st.text_input("Motorista / Condutor:", placeholder="Ex: CB PM SILVA", key="as_mot")
     obs_sel = st.text_area("Observações da Viatura / Avarias na Entrada:", placeholder="Ex: Sem alterações", key="as_obs")
 
-    # Diagnóstico de Revisão em tempo real
     if km_sel > 0:
         info_vtr = df_vtrs[df_vtrs['prefixo'] == vtr_sel].iloc[0]
         prox_rev, faltam_km, sit_rev, _ = calcular_status_revisao(km_sel, info_vtr['km_revisao_base'], info_vtr['intervalo_revisao'])
@@ -636,11 +701,11 @@ elif st.session_state["tela_ativa"] == "🛡️ Assunção de Serviço":
             st.rerun()
 
 # =============================================================================
-# TELA 3: REGISTRO DE ABASTECIMENTO COM PREENCHIMENTO AUTOMÁTICO IMEDIATO
+# TELA 3: REGISTRO DE ABASTECIMENTO COM LEITURA DE PRINT E BOTÃO VERDE
 # =============================================================================
 elif st.session_state["tela_ativa"] == "⛽ Registrar Abastecimento":
     st.subheader("⛽ Registro de Abastecimento de Viaturas")
-    st.caption("Cadastre abastecimentos. Ao colar o texto do WhatsApp, os campos são preenchidos automaticamente na tela.")
+    st.caption("Cole a mensagem, envie o print do WhatsApp ou a foto da bomba. O sistema realiza o preenchimento automático.")
 
     ja_gravou_abast = st.session_state.get("gravado_abastecimento", False)
     if ja_gravou_abast:
@@ -655,11 +720,16 @@ elif st.session_state["tela_ativa"] == "⛽ Registrar Abastecimento":
 
     metodo_abast = st.radio(
         "Modo de Entrada:",
-        ["💬 Texto do WhatsApp (Preenchimento Automático)", "📷 Leitura de Foto da Bomba / Painel", "✍️ Digitação Manual"],
+        [
+            "💬 Texto do WhatsApp (Copiar/Colar)",
+            "📱 Print / Imagem da Mensagem do WhatsApp (OCR)",
+            "📷 Foto da Bomba / Painel",
+            "✍️ Digitação Manual"
+        ],
         horizontal=True
     )
 
-    if metodo_abast == "💬 Texto do WhatsApp (Preenchimento Automático)":
+    if metodo_abast == "💬 Texto do WhatsApp (Copiar/Colar)":
         st.text_area(
             "Cole a mensagem de abastecimento do WhatsApp aqui:",
             key="campo_txt_zap_abast",
@@ -670,14 +740,31 @@ elif st.session_state["tela_ativa"] == "⛽ Registrar Abastecimento":
         if st.session_state.get("campo_txt_zap_abast", "").strip():
             preencher_automatico_abastecimento()
 
-    elif metodo_abast == "📷 Leitura de Foto da Bomba / Painel":
+    elif metodo_abast == "📱 Print / Imagem da Mensagem do WhatsApp (OCR)":
+        col_iab1, col_iab2 = st.columns([1, 1])
+        with col_iab1:
+            print_zap_ab = st.file_uploader("Upload do Print de Abastecimento:", type=['jpg', 'jpeg', 'png'], key="up_print_ab")
+            if print_zap_ab:
+                with st.spinner("🤖 Lendo print de abastecimento..."):
+                    texto_ext_ab = extrair_texto_imagem(print_zap_ab.getvalue())
+                    if texto_ext_ab:
+                        dados_ab = extrair_dados_whatsapp(texto_ext_ab)
+                        aplicar_dados_abastecimento(dados_ab, "PRINT_WHATSAPP")
+                        st.success("✅ Informações do print extraídas com sucesso!")
+                    else:
+                        st.warning("Não foi possível ler os caracteres da imagem.")
+        with col_iab2:
+            if print_zap_ab:
+                st.image(print_zap_ab, caption="Print anexado", use_container_width=True)
+
+    elif metodo_abast == "📷 Foto da Bomba / Painel":
         col_f1, col_f2 = st.columns([1, 1])
         with col_f1:
             foto_ab = st.file_uploader("Upload da foto da bomba ou odômetro:", type=['jpg', 'jpeg', 'png'], key="f_up_ab")
             foto_cam_ab = st.camera_input("Fotografar:", key="f_cam_ab")
             foto_u_ab = foto_cam_ab or foto_ab
             if foto_u_ab:
-                km_det_ab = extrair_km_imagem_ocr(foto_u_ab.getvalue())
+                km_det_ab = extrair_km_painel_ocr(foto_u_ab.getvalue())
                 if km_det_ab > 0:
                     st.session_state["ab_km"] = km_det_ab
                     st.success(f"Odômetro detectado: {km_det_ab:,} KM".replace(',', '.'))
@@ -728,7 +815,7 @@ elif st.session_state["tela_ativa"] == "⛽ Registrar Abastecimento":
             st.rerun()
 
 # =============================================================================
-# TELA 4: CORREÇÃO E EXCLUSÃO DE LANÇAMENTOS (LIMPA TOTALMENTE DO HISTÓRICO)
+# TELA 4: CORREÇÃO E EXCLUSÃO DE LANÇAMENTOS
 # =============================================================================
 elif st.session_state["tela_ativa"] == "✏️ Corrigir / Editar Lançamentos":
     st.subheader("✏️ Módulo de Correção e Exclusão de Registros")
